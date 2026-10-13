@@ -1,0 +1,16 @@
+pluginManagement {
+    repositories {
+        // 官方源优先；镜像仅作兜底（超时/失败时 Gradle 会继续尝试下一个仓库）
+        maven {
+            name = 'NeoForged'
+            url = 'https://maven.neoforged.net/releases'
+        }
+        gradlePluginPortal()
+        maven {
+            name = 'TencentMirror'
+            url = 'https://mirrors.cloud.tencent.com/nexus/repository/maven-public/'
+        }
+    }
+}
+
+rootProject.name = 'neoforbric'

@@ -1,0 +1,182 @@
+plugins {
+    id 'java'
+    id 'net.neoforged.moddev' version '2.0.42-beta'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    mavenCentral()
+    // Cloth Config（配置界面用；**只是编译期依赖**，运行时不带、没装也不影响模组工作）
+    maven { url = 'https://maven.shedaniel.me/' }
+}
+
+/*
+ * Cloth Config 的编译期配置：只给内层 body 用。
+ *
+ * 为什么要单独一个 configuration 而不是直接 implementation：
+ * 外层 loader 一行 Cloth Config 代码都没有（它跑在服务层，那里根本没有游戏界面），
+ * 把它塞进 main 的编译类路径只会让人以为外层也依赖它。
+ *
+ * compileOnly 语义：编译期能解析 me.shedaniel.*，运行时**不打包、不声明依赖** ——
+ * 没装 Cloth Config 的玩家照常玩，只是模组列表里的「配置」按钮是灰的。
+ */
+configurations {
+    bodyClothConfig
+}
+
+dependencies {
+    bodyClothConfig 'me.shedaniel.cloth:cloth-config-neoforge:15.0.140'
+}
+
+/*
+ * 为什么要有第二个 source set（body）：
+ *
+ * 本模组必须同时扮演两个角色：
+ *   1) FML 服务层的「定位器」—— 声明 IModFileCandidateLocator 服务，抢在 mods 扫描前干活；
+ *   2) 游戏层的「普通模组」—— 出现在模组列表里，并注册 Mixin 配置。
+ *
+ * 但同一个 jar 不能同时当这两者：服务层模块与游戏层模块会导出相同的包，
+ * JPMS 解析时报 "Modules neoforbric.loader and neoforbric export package ... to module minecraft"。
+ * （模组模块名固定取 modid，见 FML 的 ModFileInfo.moduleName()。）
+ *
+ * 因此拆成两个 jar，且两者的包名互不重叠：
+ *   - 外层（main，mods 里玩家安装的那个）：com.deepseek.neoforbric.{early,core,net} + services
+ *   - 内层（body，作为资源嵌在外层里）：com.deepseek.neoforbric.body[.mixin] + neoforge.mods.toml + mixins.json
+ * 运行时由定位器把内层解包到 mods/.neoforbric/ 并 addPath 进发现管线。
+ *
+ * 注意：本块必须写在 neoForge {} 之前，否则 sourceSets.body 还不存在。
+ */
+sourceSets {
+    body {
+        // 默认目录就是 src/body/java 与 src/body/resources，无需再显式添加（重复添加会导致资源重复报错）
+        compileClasspath += sourceSets.main.compileClasspath
+        // Cloth Config 只出现在 body 的编译类路径上（见上面 configurations 的说明）
+        compileClasspath += configurations.bodyClothConfig
+    }
+}
+
+neoForge {
+    version = project.neoforge_version
+
+    // 开发期运行配置：runServer 用于验证转译链路（无需图形界面）
+    runs {
+        server {
+            server()
+            programArguments.addAll '--nogui'
+        }
+        client {
+            client()
+        }
+    }
+
+    mods {
+        neoforbric {
+            sourceSet sourceSets.main
+            sourceSet sourceSets.body
+        }
+    }
+}
+
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 21
+    options.compilerArgs << '-Xlint:all,-serial,-processing'
+}
+
+/*
+ * 可复现构建：外层 jar 与内层 body jar 都不写文件系统时间戳、条目顺序固定。
+ * 不这么做的话，嵌在 jar 里的 body jar 每次构建时间戳都不同，两个 jar 的哈希永远对不上。
+ * （发布前要求：连续两次 clean build 必须字节级一致。）
+ */
+tasks.withType(AbstractArchiveTask).configureEach {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+def expandProps = [
+        'version'       : project.version,
+        'mod_id'        : project.archives_base_name,
+        'mc_version'    : project.minecraft_version,
+        'neoforge_range': '[21.1.0,21.2)',
+        'connector_version': project.connector_version
+]
+
+processResources {
+    inputs.properties(expandProps)
+    // 版本号只在 gradle.properties 定义一次，运行时读取的构建信息也由这里展开
+    filesMatching(['neoforbric-build.properties']) {
+        expand expandProps
+    }
+}
+
+processBodyResources {
+    inputs.properties(expandProps)
+    filesMatching(['META-INF/neoforge.mods.toml']) {
+        expand expandProps
+    }
+}
+
+// 内层「模组本体」jar
+tasks.register('bodyJar', Jar) {
+    dependsOn tasks.named('processBodyResources')
+    archiveFileName = 'neoforbric-body.jar'
+    destinationDirectory = layout.buildDirectory.dir('body')
+    from sourceSets.body.output
+    manifest {
+        attributes(
+                'Implementation-Title'  : 'neoforbric-body',
+                'Implementation-Version': project.version
+        )
+    }
+}
+
+/*
+ * 本 jar 只有两个职责：
+ *   1) 作为 FML 服务层的「定位器」—— 声明 IModFileCandidateLocator，抢在 mods 扫描前干活；
+ *   2) 把内层「模组本体」jar（bodyJar）作为资源嵌进来，运行时解包到 mods/.neoforbric/ 再挂进发现管线。
+ *
+ * 信雅互联（Sinytra Connector）**不再打包**：它是 MIT 组件，改为运行时按需下载进 mods/。
+ * 代价是 FML 的服务层在本模组代码运行之前就建好了，所以「本轮才下载进来的加载器本轮不在服务层」——
+ * 必须重启一次才能生效。这一点由 early/GameRelauncher 自动重启解决；
+ * 重启不可用（闸门不通过 / 子进程没起来）时降级成 NeoForge 错误界面，明确告诉玩家手动重启。
+ * 详见 docs/15-脱离信雅互联本体-可行性.md。
+ */
+jar {
+    dependsOn tasks.named('bodyJar')
+    // 把内层 jar 作为资源嵌进外层 jar
+    from(tasks.named('bodyJar')) {
+        into 'META-INF/neoforbric'
+    }
+    manifest {
+        attributes(
+                'Specification-Title'     : 'neoforbric',
+                'Specification-Vendor'    : '蓝色大肥鱼',
+                'Specification-Version'   : '1',
+                'Implementation-Title'    : project.name,
+                'Implementation-Version'  : project.version,
+                'Implementation-Vendor'   : '蓝色大肥鱼',
+                // 外层 jar 会作为 FML 服务层模块存在；模组模块名固定取 modid（neoforbric），
+                // 这里显式改名以避免两个模块重名（曾导致 "Module minecraft reads more than one module named neoforbric"）
+                'Automatic-Module-Name'   : 'neoforbric.loader'
+        )
+    }
+}
+
+// 产物直接落到实例目录的 artifacts/ 下，便于交付
+tasks.register('publishToArtifacts', Copy) {
+    dependsOn tasks.named('jar')
+    from tasks.named('jar').flatMap { it.archiveFile }
+    into layout.projectDirectory.dir('../artifacts')
+}

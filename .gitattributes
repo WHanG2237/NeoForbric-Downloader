@@ -1,0 +1,6 @@
+# 统一换行符，避免 Windows/Linux 之间来回改行尾
+* text=auto eol=lf
+*.bat text eol=crlf
+*.jar binary
+*.png binary
+gradlew text eol=lf
