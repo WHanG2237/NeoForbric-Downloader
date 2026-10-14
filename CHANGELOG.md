@@ -1,52 +1,25 @@
-# Changelog
+# 更新日志
 
-This file contains version history. The home page keeps the project description and installation guidance; release-specific details belong here and on the GitHub Release page.
+## 0.0.9
+
+### 下载与启动显示
+
+- 修复模组较多、切换处理阶段后进度条越界的问题。
+- 按当前阶段统计已处理任务，保留原件也计入完成数；阶段收尾不再丢失这部分进度。
+- Connector 与 FFAPI 分别显示实际处理结果。下载状态显示文件、尝试编号与字节进度，忽略旧阶段和旧尝试的回调。
+- 增加可选单文件分段下载，默认关闭；多个文件与多个分段共享全局和单 host 请求上限。
+- 分段读取与单流共用超时/停滞保护。等待请求额度、探测、分段读取和回退共用总时限，错误响应体保留 3 秒上限。
+- 修复取消等待时请求额度泄漏、取消下载后仍回退继续下载的问题。分段任务结束后关闭线程并清理临时文件。
+- 校验完整的 Content-Range 与响应编码；不把弱 ETag 用于 If-Range。异常范围、压缩响应等不能直接作为成功分段。
+- 精简双语首页，说明实际下载替换机制、备份与兼容边界；公开源码 ZIP 使用标准目录分隔符。
+
+分段不保证提速。首次安装/启用 Connector 或 FFAPI 仍需一次重启；本版本没有实现动态挂载。
 
 ## 0.0.8
 
-### English
+- 改写中英文配置页面说明与选项提示。
+- 加强同名目标保护、多 modid 重复识别、负缓存环境指纹与替换事务恢复。
+- 修复落盘失败且回滚失败时误删恢复记录的问题。
+- 构建固定归档顺序与时间戳，支持重复构建得到相同文件。
 
-- Refuses to overwrite a different file with the same target name. Replacements keep a backup or rollback copy and preserve a journal when recovery is incomplete.
-- Separates temporary query failures from confirmed “not found” results. Negative results expire and are reconsidered when the relevant configuration or environment changes.
-- Detects duplicate mod IDs across all mod IDs declared by a jar and verifies the winner using the file that actually reached `mods/`.
-- Caps reading an error response body at three seconds, preventing a broken server from holding the startup process indefinitely.
-- Refreshes the Chinese and English configuration text and adds the description for the translation and dependency page.
-- Keeps the 0.0.8 build reproducible and publishes the jar under its own versioned filename.
-
-### 中文
-
-- 不同内容撞名时拒绝覆盖；替换过程保留备份或回滚文件，恢复未完成时保留 journal 供下次启动继续处理。
-- 区分暂时查询失败和确定查无结果；负结果会过期，相关配置或环境变化后会重新查询。
-- 按一个 jar 声明的全部 modid 检测重复，并根据实际落地到 `mods/` 的文件核对保留项。
-- 错误响应体的读取最多等待 3 秒，避免异常服务器无限拖住启动流程。
-- 重写中英文配置文案，并补上「转译与依赖」页说明。
-- 保持 0.0.8 构建可复现，并使用独立的版本文件名发布。
-
-## 0.0.7
-
-- Added safer configuration migration, automatic restart keep-alive behavior, duplicate handling, the skip list, and a revised in-game configuration screen.
-- Clarified that failed searches leave the original mod for NeoForge to report instead of silently pretending that the mod was fixed.
-
-## 0.0.6
-
-- Reworked the Cloth Config screen, timeout units, port-mapping format, configuration persistence, and backup handling.
-
-## 0.0.5
-
-- Added download deadlines, retry/resume behavior, visible startup progress, and a CurseForge fallback path.
-
-## 0.0.4
-
-- Added community port mappings, dependency completion, duplicate-mod cleanup, and stronger post-download identity checks.
-
-## 0.0.3
-
-- Added parent-process keep-alive, restart log continuity, clearer independent logs, and dependency-based Connector detection.
-
-## 0.0.2
-
-- Added the first automatic restart flow, original filename preservation, and safer handling of disabled compatibility components.
-
-## 0.0.1
-
-- Initial release: find NeoForge builds for Forge/Fabric mods, download Connector and Forgified Fabric API when needed, and restart the game when the service layer must be rediscovered.
+历史测试数据与未发布候选的哈希不作为正式发布文件的身份依据。请以对应 Release 的校验清单为准。

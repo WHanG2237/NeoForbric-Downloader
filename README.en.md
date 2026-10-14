@@ -2,105 +2,77 @@
 
 [中文说明](README.md)
 
-An automatic mod downloader and replacement tool for Minecraft **1.21.1 / NeoForge 21.1.x**. It looks for NeoForge builds of Forge and Fabric mods and installs them into the current instance when possible.
+An automatic mod downloader and replacement tool for Minecraft **1.21.1 / NeoForge 21.1.x**. It identifies Forge and Fabric mods, looks for suitable NeoForge builds, and downloads and installs them when available.
 
-The in-game interface uses “translation” as a presentation theme. The actual work is querying repositories, downloading files, verifying their metadata, replacing files safely, and installing separate compatibility components when they are required.
-
-## What it does
-
-- **Forge mods:** looks for a NeoForge build for the current Minecraft version.
-- **Fabric mods:** looks for a port or a matching NeoForge build; when a Fabric mod must run through a compatibility layer, it can download Sinytra Connector and Forgified Fabric API.
-- **Port mappings:** lets you pin a source mod to a project on Modrinth or CurseForge.
-- **Required dependencies:** can install missing required dependencies for newly installed or replaced mods. Optional dependencies are not installed automatically.
-- **File protection:** backs up replaced files by default, refuses to overwrite a different file with the same name, and keeps recovery records when an operation is interrupted.
-
-NeoForbric is not a universal bytecode translator and cannot make every Forge or Fabric mod work on NeoForge. If no suitable build or compatibility support is available, the original file is kept and NeoForge reports the remaining problem.
-
-## Requirements and scope
-
-- Minecraft **1.21.1**
-- NeoForge **21.1.x**; client verification used **21.1.256**
-- A network connection for repository queries and downloads
-- Optional [Cloth Config](https://modrinth.com/mod/cloth-config) for the in-game configuration screen
-
-The project is currently a client-focused tool. See [Known limitations](docs/KNOWN-LIMITATIONS.md) before using it in a large modpack or on a dedicated server.
+The in-game interface presents this process as “translation.” The implementation queries repositories, downloads files, verifies them, and replaces files with backups. Sinytra Connector and Forgified Fabric API are downloaded separately when compatibility support is needed. **It cannot make every Forge or Fabric mod work on NeoForge.**
 
 ## Installation
 
-1. Prepare a Minecraft 1.21.1 / NeoForge 21.1.x instance.
-2. Exit the game and back up the instance's `mods` folder.
-3. Download `neoforbric-0.0.8.jar` from the GitHub Release and place it in `mods`.
-4. Start the game. Repository queries and downloads require network access.
+1. Prepare a Minecraft 1.21.1 / NeoForge 21.1.x instance. Client checks use NeoForge 21.1.256.
+2. Exit the game and back up the instance's `mods/` folder.
+3. Download `neoforbric-0.0.9.jar` from [Releases](https://github.com/WHanG2237/NeoForbric-Downloader/releases) and put it in `mods/`. If 0.0.9 is not listed yet, wait for its release; source availability does not mean a binary has been published.
+4. Start the game. Initial queries and downloads require a network connection.
 
-When Connector or Forgified Fabric API is installed or enabled for the first time, the game must restart once so NeoForge can discover the new service-layer component. NeoForbric normally starts that restart automatically; if the launcher does not allow it, follow the in-game message and restart manually.
+**Installing or enabling Connector / FFAPI for the first time still requires one restart.** NeoForbric normally starts it automatically. If the launcher blocks it, follow the message and restart manually. These components cannot be mounted dynamically in the same JVM.
 
-The GitHub-generated **Source code** archive is source code, not a mod. Do not put it in `mods`.
+GitHub's `Source code` archives and the source ZIP are for developers. Do not put them in `mods/`.
+
+## Behavior
+
+- Looks for NeoForge builds for the current Minecraft version.
+- Uses port mappings or separate compatibility components for Fabric mods when applicable.
+- Installs missing required dependencies for newly installed mods; optional dependencies are not installed automatically.
+- Backs up originals by default and refuses to overwrite a different file with the same name.
+- Records unfinished replacements and tries to recover them on the next start.
+
+When no suitable build is available, the original is kept and the reason is reported. Keeping the original does not guarantee that NeoForge can load it. The available replacement may have a different mod version.
 
 ## Configuration
 
-With Cloth Config installed, open **Mods → NeoForbric → Configure**. The pages cover general behavior, automatic restart, translation and dependencies, downloads and network, port mappings, the skip list, and advanced settings.
-
-All configuration changes take effect after saving and restarting the game. Without Cloth Config, edit these files directly:
+Install optional [Cloth Config](https://modrinth.com/mod/cloth-config) to use **Mods → NeoForbric → Configure**. Save and restart to apply changes. Without it, edit:
 
 | File | Purpose |
 | --- | --- |
-| `config/neoforbric/config.properties` | Main switches, sources, network, and restart settings |
+| `config/neoforbric/config.properties` | Main switches, sources, downloads, restart settings |
 | `config/neoforbric/ports.properties` | Source mod IDs and preferred port projects |
-| `config/neoforbric/blacklist.properties` | Mod IDs that NeoForbric must leave untouched |
+| `config/neoforbric/blacklist.properties` | Skip list of mod IDs to leave untouched |
 
-The skip list takes priority over port mappings and automatic crawling. It does not prevent Connector or Forgified Fabric API from being installed when another Fabric mod needs them.
+Logs are in `logs/neoforbric.log`; the latest processing report is `logs/neoforbric-report.json`.
 
-## Files and logs
+## Concurrent files and segmented downloads
 
-| Path | Purpose |
-| --- | --- |
-| `mods/.neoforbric/backup/` | Long-term backups of replaced or removed originals |
-| `mods/.neoforbric/rollback/` | Temporary originals kept during an installation |
-| `mods/.neoforbric/journal/` | Recovery records for unfinished file operations |
-| `logs/neoforbric.log` | Detailed decisions, downloads, replacements, and recovery |
-| `logs/neoforbric-report.json` | Machine-readable report for the current run |
+Several files can download concurrently. Version 0.0.9 adds optional ranges within one file. It requires a suitable known size, a checksum, and valid HTTP Range support. All parts are verified and merged before the result is installed. Unsupported responses fall back to a single stream. Cancellation and an exhausted total deadline stop the download.
 
-Sinytra Connector keeps its own conversion cache. In the tested setup it uses `.cache/connector/`; that cache is separate from NeoForbric's backups and is not bundled into this project.
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `http.parallelism` | `8` | Concurrent file-processing tasks |
+| `http.segmented.enable` | `false` | Enable ranges within a file; off by default |
+| `http.segmented.maxSegments` | `4` | Maximum ranges per file |
+| `http.segmented.thresholdMb` | `16` | Minimum file size for attempting ranges |
+| `http.segmented.minSegmentMb` | `4` | Minimum target size of each range |
+| `http.maxActiveRequests` | `8` | Shared concurrent download request limit, including probes |
+| `http.maxRequestsPerHost` | `4` | Concurrent download request limit per host |
 
-## Current version
+Both forms of concurrency share the request limits. More connections do not increase an already saturated total bandwidth. Speed improvements depend on the server and network; no real-CDN speedup is promised.
 
-The current release is **0.0.8**. See [CHANGELOG.md](CHANGELOG.md) for the version history and the GitHub Release for the downloadable jar and SHA-256 value.
+The startup bar shows completed tasks in the **current stage** and resets when the stage changes. File status shows the current attempt and byte progress. Failed, skipped, and unchanged tasks also count as processed.
 
-## Verification and limits
+## Backups and recovery
 
-The 0.0.8 candidate passed the existing offline checks (170), fix probes (170), and engine probes (141); two independent builds produced the same jar. The published documentation also records the eight real-instance scenarios and their raw logs.
+Original files are backed up under `mods/.neoforbric/backup/` by default. Temporary rollback files and `journal/` records help recover incomplete changes. They are not bundled copies of the compatibility layer. Do not remove them while the game is running. For manual recovery, exit the game first and check file identities and logs before restoring a backup.
 
-The project has not completed dedicated-server testing, verification with a real CurseForge API key, large modpack performance testing, or every possible operating-system failure mode. A multi-mod jar may contain unique mod IDs; when duplicate cleanup removes that jar, inspect the report and the backup before deleting anything manually.
+Connector and FFAPI are independent downloads, not embedded in the NeoForbric JAR. Their compatibility remains subject to their upstream projects.
 
-See [Known limitations](docs/KNOWN-LIMITATIONS.md) for the full list. Do not describe NeoForbric as a guaranteed universal loader.
+## Limits, builds, and changes
 
-## Build from source
+- [Known limitations](docs/KNOWN-LIMITATIONS.md)
+- [Build from source](docs/BUILD.md)
+- [Changelog](CHANGELOG.en.md) · [中文更新日志](CHANGELOG.md)
 
-You need **JDK 21** and network access for build dependencies. The repository includes Gradle Wrapper 8.14.2.
+The source version is **0.0.9**. Use Release assets and their checksum file to identify a published binary.
 
-Windows PowerShell:
+## Credits and license
 
-```powershell
-.\gradlew.bat build
-```
+Thanks to NeoForge, [Sinytra Connector](https://github.com/Sinytra/Connector), Forgified Fabric API, Modrinth, CurseForge, MCIM, and the mod authors. Repository and mirror availability is outside this project's control. Downloads remain subject to the platforms' and authors' terms. Third-party components retain their own copyright and licenses.
 
-Linux / macOS:
-
-```bash
-chmod +x gradlew
-./gradlew build
-```
-
-The artifact is `build/libs/neoforbric-0.0.8.jar`. See [Build and project structure](docs/BUILD.md) for the two source sets and runtime layout.
-
-## Reporting a problem
-
-When opening an issue, include the Minecraft, NeoForge, and NeoForbric versions, reproduction steps, the affected mod versions, `neoforbric.log`, and `neoforbric-report.json`. Add `latest.log` or a crash report when relevant.
-
-Remove personal paths, private server addresses, and API keys before uploading logs. Never publish a CurseForge API key.
-
-## License and third-party components
-
-NeoForbric is released under the [MIT License](LICENSE). The project is independent from Mojang, NeoForged, Sinytra, Modrinth, and CurseForge.
-
-Sinytra Connector and Forgified Fabric API are not bundled in this jar. When needed, NeoForbric downloads the corresponding upstream files at runtime; those components remain under their own licenses.
+NeoForbric source is distributed under the [MIT License](LICENSE).

@@ -1,0 +1,36 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="MIT"
+
+[[mods]]
+modId="neoforbric"
+version="${version}"
+displayName="NeoForbric"
+authors="蓝色大肥鱼"
+# 图标路径是「相对本 jar 根目录」的，不是资源包那种 assets/... 路径。
+# 对照实测：Jade 写 logoFile="icon.png" 且文件就在 jar 根；JEI 写 logoFile="jei-icon.png" 同理。
+# 本文件属于内层 body jar，而 src/body/resources/ 下的东西会直接落在 body jar 根目录，
+# 所以文件放 src/body/resources/icon.png、这里写 "icon.png" 即可。
+logoFile="icon.png"
+description='''
+NeoForbric 万能转译加载器 —— 理论上兼容 Forge、Fabric、NeoForge 三大主流模组加载器。
+
+同一份 mods 文件夹里混装不同加载器的模组也能正常启动；需要时会自动补齐 Fabric 侧所需的组件。
+'''
+
+[[dependencies.neoforbric]]
+modId="neoforge"
+type="required"
+versionRange="${neoforge_range}"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.neoforbric]]
+modId="minecraft"
+type="required"
+versionRange="[${mc_version}]"
+ordering="NONE"
+side="BOTH"
+
+[[mixins]]
+config="neoforbric.mixins.json"

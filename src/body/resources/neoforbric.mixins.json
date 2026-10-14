@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "com.deepseek.neoforbric.body.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "ModListScreenMixin",
+    "BrandingControlMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
