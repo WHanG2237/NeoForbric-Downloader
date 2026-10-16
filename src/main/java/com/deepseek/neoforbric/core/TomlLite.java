@@ -162,6 +162,63 @@ public final class TomlLite {
     }
 
 
+    public static Map<String, String> modIdVersions(String toml) {
+        Map<String, String> result = new LinkedHashMap<>();
+        if (toml == null) {
+            return result;
+        }
+        String id = null;
+        String version = null;
+        boolean inModsBlock = false;
+        for (String rawLine : toml.split("\\R")) {
+            String line = stripComment(rawLine).trim();
+            if (line.isEmpty()) {
+                continue;
+            }
+            if (line.startsWith("[")) {
+                if (inModsBlock) {
+                    addModVersion(result, id, version);
+                    id = null;
+                    version = null;
+                }
+                inModsBlock = line.replace(" ", "").equalsIgnoreCase("[[mods]]");
+                continue;
+            }
+            if (!inModsBlock) {
+                continue;
+            }
+            int eq = line.indexOf('=');
+            if (eq <= 0) {
+                continue;
+            }
+            String key = line.substring(0, eq).trim();
+            String value = unquote(line.substring(eq + 1).trim());
+            if ("modId".equals(key)) {
+                if (id == null) {
+                    id = value;
+                }
+            } else if ("version".equals(key) && version == null) {
+                version = value;
+            }
+        }
+        addModVersion(result, id, version);
+        return result;
+    }
+
+
+    private static void addModVersion(Map<String, String> result, String id, String version) {
+        if (id == null || id.isBlank()) {
+            return;
+        }
+        for (String key : result.keySet()) {
+            if (key.equalsIgnoreCase(id)) {
+                return;
+            }
+        }
+        result.put(id, version == null ? "" : version);
+    }
+
+
     public static Map<String, String> firstModBlock(String toml) {
         Map<String, String> result = new LinkedHashMap<>();
         if (toml == null) {

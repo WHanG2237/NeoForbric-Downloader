@@ -11,7 +11,9 @@ public final class ScreenText {
     static {
         DICTIONARY.put("信雅互联", "Sinytra Connector");
         DICTIONARY.put("前置", "FFAPI");
-        DICTIONARY.put("万能转译加载器", "NeoForbric");
+        DICTIONARY.put("万能转译加载器", BuildInfo.name());
+        DICTIONARY.put("模组接力", BuildInfo.name());
+        DICTIONARY.put("原名 NeoForbric", "formerly NeoForbric");
         DICTIONARY.put("正在翻译", "Translating");
         DICTIONARY.put("正在下载", "Translating");
         DICTIONARY.put("官方源", "official");

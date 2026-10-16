@@ -7,6 +7,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -82,6 +83,48 @@ public final class ModJarScanner {
     }
 
 
+    private static Map<String, String> providedVersions(ZipFile zip, boolean neo, boolean forge, boolean fabric,
+            boolean quilt) throws IOException {
+        Map<String, String> result = new LinkedHashMap<>();
+        if (neo) {
+            mergeVersions(result, TomlLite.modIdVersions(readEntry(zip, NEOFORGE_METADATA)), zip);
+        }
+        if (forge) {
+            mergeVersions(result, TomlLite.modIdVersions(readEntry(zip, FORGE_METADATA)), zip);
+        }
+        if (fabric) {
+            Map<String, Object> json = JsonLite.asObject(JsonLite.parseQuietly(readEntry(zip, FABRIC_METADATA), FABRIC_METADATA));
+            putVersion(result, JsonLite.str(json, "id", ""), JsonLite.str(json, "version", ""));
+        }
+        if (quilt) {
+            Map<String, Object> json = JsonLite.asObject(JsonLite.parseQuietly(readEntry(zip, QUILT_METADATA), QUILT_METADATA));
+            Map<String, Object> loader = JsonLite.asObject(json.get("quilt_loader"));
+            putVersion(result, JsonLite.str(loader, "id", ""), JsonLite.str(loader, "version", ""));
+        }
+        return result;
+    }
+
+
+    private static void mergeVersions(Map<String, String> target, Map<String, String> source, ZipFile zip) {
+        for (Map.Entry<String, String> entry : source.entrySet()) {
+            putVersion(target, entry.getKey(), resolveVersion(entry.getValue(), zip));
+        }
+    }
+
+
+    private static void putVersion(Map<String, String> target, String id, String version) {
+        if (id == null || id.isBlank()) {
+            return;
+        }
+        for (String key : target.keySet()) {
+            if (key.equalsIgnoreCase(id)) {
+                return;
+            }
+        }
+        target.put(id, version == null ? "" : version);
+    }
+
+
     public static ModJarInfo inspect(Path jar) throws IOException {
         String fileName = jar.getFileName().toString();
         long size = Files.size(jar);
@@ -109,35 +152,37 @@ public final class ModJarScanner {
                 markers.add(ModKind.LITELOADER);
             }
             List<String> provided = providedModIds(zip);
+            Map<String, String> versions = providedVersions(zip, neo, forge, fabric, quilt);
 
             if (neo) {
                 Map<String, String> meta = TomlLite.firstModBlock(readEntry(zip, NEOFORGE_METADATA));
                 return new ModJarInfo(jar, fileName, ModKind.NEOFORGE, meta.getOrDefault("modId", ""),
                         resolveVersion(meta.getOrDefault("version", ""), zip), meta.getOrDefault("displayName", ""),
-                        size, markers, provided);
+                        size, markers, provided, versions);
             }
             if (fabric) {
                 Map<String, Object> json = JsonLite.asObject(JsonLite.parseQuietly(readEntry(zip, FABRIC_METADATA), fileName));
                 return new ModJarInfo(jar, fileName, ModKind.FABRIC, JsonLite.str(json, "id", ""),
-                        JsonLite.str(json, "version", ""), JsonLite.str(json, "name", ""), size, markers, provided);
+                        JsonLite.str(json, "version", ""), JsonLite.str(json, "name", ""), size, markers, provided,
+                        versions);
             }
             if (quilt) {
                 Map<String, Object> json = JsonLite.asObject(JsonLite.parseQuietly(readEntry(zip, QUILT_METADATA), fileName));
                 Map<String, Object> quiltLoader = JsonLite.asObject(json.get("quilt_loader"));
                 return new ModJarInfo(jar, fileName, ModKind.QUILT, JsonLite.str(quiltLoader, "id", ""),
                         JsonLite.str(quiltLoader, "version", ""), JsonLite.str(quiltLoader, "id", ""), size, markers,
-                        provided);
+                        provided, versions);
             }
             if (forge) {
                 Map<String, String> meta = TomlLite.firstModBlock(readEntry(zip, FORGE_METADATA));
                 return new ModJarInfo(jar, fileName, ModKind.FORGE, meta.getOrDefault("modId", ""),
                         resolveVersion(meta.getOrDefault("version", ""), zip), meta.getOrDefault("displayName", ""),
-                        size, markers, provided);
+                        size, markers, provided, versions);
             }
             if (lite) {
-                return new ModJarInfo(jar, fileName, ModKind.LITELOADER, "", "", "", size, markers, provided);
+                return new ModJarInfo(jar, fileName, ModKind.LITELOADER, "", "", "", size, markers, provided, versions);
             }
-            return new ModJarInfo(jar, fileName, ModKind.UNKNOWN, "", "", "", size, markers, provided);
+            return new ModJarInfo(jar, fileName, ModKind.UNKNOWN, "", "", "", size, markers, provided, versions);
         }
     }
 

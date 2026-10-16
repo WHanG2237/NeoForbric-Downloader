@@ -16,13 +16,22 @@ public final class ProgressStage {
     private final AtomicInteger kept = new AtomicInteger();
     private final AtomicBoolean ended = new AtomicBoolean();
     private final java.util.Set<String> terminalTasks = new java.util.HashSet<>();
+    private final boolean diagnostics;
 
     public ProgressStage(ProgressReporter reporter, String id, String label, int totalSteps) {
+        this(reporter, id, label, totalSteps, false);
+    }
+
+    public ProgressStage(ProgressReporter reporter, String id, String label, int totalSteps, boolean diagnostics) {
         this.reporter = reporter == null ? ProgressReporter.NOOP : reporter;
         this.id = id + ":" + java.util.UUID.randomUUID();
         this.label = label == null ? "" : label;
         this.total.set(Math.max(0, totalSteps));
+        this.diagnostics = diagnostics;
         this.reporter.stageBegin(this.id, this.label, this.total.get());
+        if (diagnostics) {
+            ForbricLog.debug("progress begin: stage=%s total=%d", this.id, this.total.get());
+        }
     }
 
 
@@ -101,6 +110,11 @@ public final class ProgressStage {
             reporter.message(taskLabel);
         }
         reporter.stageState(id, label, done.get(), failed.get(), skipped.get(), kept.get(), total.get());
+        if (diagnostics) {
+            String result = counter == done ? "done" : counter == kept ? "kept" : counter == skipped ? "skipped" : "failed";
+            ForbricLog.debug("progress terminal: stage=%s task=%s result=%s finished=%d/%d done=%d kept=%d skipped=%d failed=%d",
+                    id, taskId, result, finished(), total(), done.get(), kept.get(), skipped.get(), failed.get());
+        }
     }
 
 
@@ -109,6 +123,9 @@ public final class ProgressStage {
             return;
         }
         reporter.stageEnd(id, label, done.get(), failed.get(), skipped.get(), kept.get());
+        if (diagnostics) {
+            ForbricLog.debug("progress end: stage=%s finished=%d/%d", id, finished(), total());
+        }
     }
 
 

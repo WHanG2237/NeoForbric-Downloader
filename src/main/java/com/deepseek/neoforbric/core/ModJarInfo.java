@@ -3,14 +3,22 @@ package com.deepseek.neoforbric.core;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 
 public record ModJarInfo(Path path, String fileName, ModKind kind, String modId, String version, String displayName,
-        long size, List<ModKind> markers, List<String> providedModIds) {
+        long size, List<ModKind> markers, List<String> providedModIds, Map<String, String> providedVersions) {
+
+    public ModJarInfo(Path path, String fileName, ModKind kind, String modId, String version, String displayName,
+            long size, List<ModKind> markers, List<String> providedModIds) {
+        this(path, fileName, kind, modId, version, displayName, size, markers, providedModIds, Map.of());
+    }
+
 
     public ModJarInfo {
         markers = markers == null ? List.of() : List.copyOf(markers);
         providedModIds = providedModIds == null ? List.of() : List.copyOf(providedModIds);
+        providedVersions = providedVersions == null ? Map.of() : Map.copyOf(providedVersions);
     }
 
 
@@ -37,6 +45,20 @@ public record ModJarInfo(Path path, String fileName, ModKind kind, String modId,
             }
         }
         return false;
+    }
+
+
+    public String providedVersion(String id) {
+        if (id == null || id.isBlank()) {
+            return null;
+        }
+        String wanted = id.trim();
+        for (Map.Entry<String, String> entry : providedVersions.entrySet()) {
+            if (entry.getKey() != null && entry.getKey().equalsIgnoreCase(wanted)) {
+                return entry.getValue();
+            }
+        }
+        return null;
     }
 
 

@@ -62,8 +62,40 @@ public final class DuplicateJars {
     }
 
 
+    public record NativeOverlap(ModJarInfo jar, List<String> sharedIds, List<String> uncoveredIds,
+            List<ModJarInfo> providers) {
+
+        public NativeOverlap {
+            sharedIds = List.copyOf(sharedIds);
+            uncoveredIds = List.copyOf(uncoveredIds);
+            providers = List.copyOf(providers);
+        }
+
+
+        public String describeIds() {
+            return sharedIds.isEmpty() ? "no shared modid" : String.join("/", sharedIds);
+        }
+
+
+        public String describeProviders() {
+            StringBuilder sb = new StringBuilder();
+            for (ModJarInfo provider : providers) {
+                if (sb.length() > 0) {
+                    sb.append("; ");
+                }
+                sb.append(provider.fileName()).append(" [").append(provider.kind().display()).append(' ')
+                        .append(provider.version() == null || provider.version().isBlank() ? "?" : provider.version())
+                        .append(", id=")
+                        .append(provider.allModIds().isEmpty() ? "?" : String.join("/", provider.allModIds()))
+                        .append("] at ").append(provider.path());
+            }
+            return sb.length() == 0 ? "no native file" : sb.toString();
+        }
+    }
+
+
     public record Plan(Set<String> nativeModIds, List<ModJarInfo> skipped, List<ModJarInfo> processable,
-            Map<String, Conflict> losers) {
+            Map<String, Conflict> losers, Map<String, NativeOverlap> nativeOverlaps) {
 
 
         public boolean isSkipped(String fileName) {
@@ -111,7 +143,15 @@ public final class DuplicateJars {
             }
         }
 
+        List<ModJarInfo> natives = new ArrayList<>();
+        for (ModJarInfo jar : jars) {
+            if (jar.kind() == ModKind.NEOFORGE && !jar.allModIds().isEmpty()) {
+                natives.add(jar);
+            }
+        }
+
         List<ModJarInfo> skipped = new ArrayList<>();
+        Map<String, NativeOverlap> nativeOverlaps = new LinkedHashMap<>();
         List<ModJarInfo> candidates = new ArrayList<>();
         for (ModJarInfo jar : jars) {
             if (!transpilable(jar)) {
@@ -119,6 +159,7 @@ public final class DuplicateJars {
             }
             if (sharesAnyId(jar, nativeModIds)) {
                 skipped.add(jar);
+                nativeOverlaps.put(jar.fileName(), overlapOf(jar, natives, nativeModIds));
                 continue;
             }
             candidates.add(jar);
@@ -134,7 +175,37 @@ public final class DuplicateJars {
                 processable.add(jar);
             }
         }
-        return new Plan(Set.copyOf(nativeModIds), List.copyOf(skipped), List.copyOf(processable), Map.copyOf(losers));
+        return new Plan(Set.copyOf(nativeModIds), List.copyOf(skipped), List.copyOf(processable),
+                Map.copyOf(losers), Map.copyOf(nativeOverlaps));
+    }
+
+
+    private static NativeOverlap overlapOf(ModJarInfo jar, List<ModJarInfo> natives, Set<String> nativeModIds) {
+        List<String> shared = new ArrayList<>();
+        List<String> uncovered = new ArrayList<>();
+        for (String id : jar.allModIds()) {
+            if (id == null || id.isBlank()) {
+                continue;
+            }
+            if (nativeModIds.contains(lower(id))) {
+                shared.add(id);
+            } else {
+                uncovered.add(id);
+            }
+        }
+        List<ModJarInfo> providers = new ArrayList<>();
+        for (ModJarInfo nativeJar : natives) {
+            if (nativeJar.fileName().equals(jar.fileName())) {
+                continue;
+            }
+            for (String id : shared) {
+                if (nativeJar.provides(id)) {
+                    providers.add(nativeJar);
+                    break;
+                }
+            }
+        }
+        return new NativeOverlap(jar, shared, uncovered, providers);
     }
 
 

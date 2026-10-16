@@ -97,16 +97,17 @@ public final class FileInstaller {
         }
         steps.add("target path " + destination.getFileName());
 
+        boolean reuse = false;
         if (!destination.equals(original) && Files.exists(destination)) {
             if (sameContent(destination, staging)) {
-                deleteQuietly(staging);
-                steps.add("the target already holds the same file, reused it");
-                return new Outcome(true, true, destination, null, null, null, "", List.copyOf(steps), null);
+                reuse = true;
+                steps.add("the target already holds the same content, only the original has to leave the mods folder");
+            } else {
+                return failure(Step.CONFLICT, "target " + destination.getFileName()
+                        + " already exists and is a different file (it provides " + identity(destination)
+                        + ", the new file provides " + identity(staging)
+                        + "); both files were left untouched", steps);
             }
-            return failure(Step.CONFLICT, "target " + destination.getFileName()
-                    + " already exists and is a different file (it provides " + identity(destination)
-                    + ", the new file provides " + identity(staging)
-                    + "); both files were left untouched", steps);
         }
 
         Path backupPath = null;
@@ -163,27 +164,53 @@ public final class FileInstaller {
         }
         journal.phase(transaction, InstallJournal.Phase.PROTECTED);
 
-        try {
-            mover.move(staging, destination);
-            steps.add("placed the new file at " + destination.getFileName());
-        } catch (IOException e) {
-            Restore restored = restore(original, backupPath, rollbackPath);
-            if (restored.ok()) {
-                journal.close(transaction);
+        Path leftover = null;
+        if (reuse) {
+            if (!Files.isRegularFile(destination) || !sameContent(destination, staging)) {
+                Restore restored = restore(original, backupPath, rollbackPath);
+                if (restored.ok()) {
+                    journal.close(transaction);
+                    return new Outcome(false, false, null, backupPath, rollbackPath, Step.PLACE,
+                            "the reused target no longer holds the new file: " + destination.getFileName()
+                                    + "; " + restored.detail(),
+                            List.copyOf(steps), null);
+                }
+                steps.add("kept the installation record: the original could not be put back");
                 return new Outcome(false, false, null, backupPath, rollbackPath, Step.PLACE,
-                        "could not place the new file: " + e + "; " + restored.detail(),
-                        List.copyOf(steps), null);
+                        "the reused target no longer holds the new file: " + destination.getFileName()
+                                + "; the original could not be restored: " + restored.detail()
+                                + "; the installation record was kept and the next start will try to restore it again",
+                        List.copyOf(steps), restored.location());
             }
-            steps.add("kept the installation record: the original could not be put back");
-            return new Outcome(false, false, null, backupPath, rollbackPath, Step.PLACE,
-                    "could not place the new file: " + e + "; the original could not be restored: "
-                            + restored.detail() + "; the installation record was kept and the next start will try "
-                            + "to restore it again",
-                    List.copyOf(steps), restored.location());
+            steps.add("the reused target still holds the new content after the original was retired");
+            if (deleteQuietly(staging)) {
+                steps.add("removed the staged copy");
+            } else {
+                leftover = staging;
+                steps.add("the staged copy could not be removed, it is still at " + staging);
+            }
+        } else {
+            try {
+                mover.move(staging, destination);
+                steps.add("placed the new file at " + destination.getFileName());
+            } catch (IOException e) {
+                Restore restored = restore(original, backupPath, rollbackPath);
+                if (restored.ok()) {
+                    journal.close(transaction);
+                    return new Outcome(false, false, null, backupPath, rollbackPath, Step.PLACE,
+                            "could not place the new file: " + e + "; " + restored.detail(),
+                            List.copyOf(steps), null);
+                }
+                steps.add("kept the installation record: the original could not be put back");
+                return new Outcome(false, false, null, backupPath, rollbackPath, Step.PLACE,
+                        "could not place the new file: " + e + "; the original could not be restored: "
+                                + restored.detail() + "; the installation record was kept and the next start will try "
+                                + "to restore it again",
+                        List.copyOf(steps), restored.location());
+            }
         }
         journal.phase(transaction, InstallJournal.Phase.PLACED);
 
-        Path leftover = null;
         if (rollbackPath != null) {
             if (deleteQuietly(rollbackPath)) {
                 steps.add("removed the temporary rollback file");
@@ -193,7 +220,7 @@ public final class FileInstaller {
             }
         }
         journal.close(transaction);
-        return new Outcome(true, false, destination, backupPath, leftover, null, "", List.copyOf(steps), null);
+        return new Outcome(true, reuse, destination, backupPath, leftover, null, "", List.copyOf(steps), null);
     }
 
 

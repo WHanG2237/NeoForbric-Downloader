@@ -178,7 +178,7 @@ public final class TranspileState {
         try {
             Files.createDirectories(file.getParent());
             try (Writer writer = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) {
-                props.store(writer, "NeoForbric translation memory. Delete this file to decide everything again.");
+                props.store(writer, ForbricLog.TAG + " translation memory. Delete this file to decide everything again.");
             }
         } catch (IOException e) {
             ForbricLog.warn("state write failed: %s", e.toString());

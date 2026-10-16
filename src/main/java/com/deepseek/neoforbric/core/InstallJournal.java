@@ -302,7 +302,8 @@ public final class InstallJournal {
 
     private String render(Entry entry) {
         StringBuilder sb = new StringBuilder(512);
-        sb.append("# NeoForbric file installation record. One file per unfinished operation.\n");
+        sb.append("# ").append(ForbricLog.TAG).append(" (formerly NeoForbric) file installation record."
+                + " One file per unfinished operation.\n");
         sb.append("# Deleting this file removes the record but leaves the files on disk untouched.\n");
         sb.append("version=").append(VERSION).append('\n');
         sb.append("kind=").append(entry.kind().name()).append('\n');

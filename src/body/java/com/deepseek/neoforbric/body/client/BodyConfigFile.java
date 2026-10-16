@@ -18,11 +18,14 @@ import java.util.regex.Pattern;
 final class BodyConfigFile {
 
     private static final List<String> PORTS_HEADER = List.of(
-            "# NeoForbric port map (whitelist). Changes take effect after restarting the game.",
+            "# " + BodyLog.tag() + " (formerly NeoForbric) port map (whitelist). Changes take effect"
+                    + " after restarting the game.",
             "#",
             "# One entry per line: <source modid> = <target>[,<target>...][@<expected modid>]",
-            "#   target: a bare number is a CurseForge project id, anything else is a Modrinth",
-            "#           id or slug; cf: / mr: pick the source, any: searches the whole chain.",
+            "#   target: a Modrinth project id or slug; mr: / modrinth: also work, and any:",
+            "#           searches the whole chain.",
+            "#   A bare number is a CurseForge project id. CurseForge access was removed in 0.0.10,",
+            "#   so such a target is skipped with a warning and is never read as a Modrinth id.",
             "#   Targets are tried in order, first hit wins.",
             "#   Without @, the expected modid is the source modid on the left of the equals sign.",
             "#",
@@ -33,7 +36,8 @@ final class BodyConfigFile {
 
 
     private static final List<String> BLACKLIST_HEADER = List.of(
-            "# NeoForbric blacklist. Changes take effect after restarting the game.",
+            "# " + BodyLog.tag() + " (formerly NeoForbric) blacklist. Changes take effect after"
+                    + " restarting the game.",
             "#",
             "# One modid per line; `modid = note` also works (the note is for humans only).",
             "# Case insensitive; blank lines and lines starting with # or ! are ignored.",
@@ -119,6 +123,16 @@ final class BodyConfigFile {
 
     void set(String key, Object value) {
         values.put(key, value instanceof Boolean bool ? Boolean.toString(bool) : String.valueOf(value));
+    }
+
+    void applyRecommendedDownloads() {
+        set("http.parallelism", 1);
+        set("http.segmented.enable", false);
+        set("http.segmented.maxSegments", 2);
+        set("http.segmented.thresholdMb", 16);
+        set("http.segmented.minSegmentMb", 4);
+        set("http.maxActiveRequests", 4);
+        set("http.maxRequestsPerHost", 4);
     }
 
 

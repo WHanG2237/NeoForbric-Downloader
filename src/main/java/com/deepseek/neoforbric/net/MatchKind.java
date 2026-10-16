@@ -4,7 +4,6 @@ package com.deepseek.neoforbric.net;
 public enum MatchKind {
 
     HASH(true, "sha1 lookup"),
-    FINGERPRINT(true, "fingerprint match"),
     PORT_MAP(false, "port map"),
     EXACT_NAME(false, "exact name"),
     PREFIX(false, "name prefix"),

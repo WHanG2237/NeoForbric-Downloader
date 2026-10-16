@@ -11,12 +11,24 @@ import java.time.format.DateTimeFormatter;
 
 
 public final class BodyLog {
-    private static final String TAG = "NeoForbric";
+    private static volatile String TAG = "neoforbric";
     private static final String LOGGER_NAME = "neoforbric";
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
     private static final Object LOCK = new Object();
 
     private BodyLog() {}
+
+
+    public static void displayName(String name) {
+        if (name != null && !name.isBlank()) {
+            TAG = name;
+        }
+    }
+
+
+    public static String tag() {
+        return TAG;
+    }
 
 
     public static void game(String format, Object... args) {

@@ -100,7 +100,7 @@ public final class SegmentedDownload {
     private InputStream guarded(HttpResponse<InputStream> response, long attemptDeadline, long deadline,
             long size, String what, String url) {
         return new Http.TransferWatchdog(response.body(), stallTimeout, attemptDeadline, deadline, size, 0,
-                what, "segmented", url, null, 1, Http.DownloadScope.NONE);
+                what, "segmented", url, null, 1, Http.DownloadScope.NONE, null);
     }
 
     public Result download(String url, Path target, Path temp, String what, String expectedSha1, long expectedSize,
@@ -121,7 +121,7 @@ public final class SegmentedDownload {
                 List<Range> ranges = plan(total, settings);
                 Files.createDirectories(directory);
                 workers = Executors.newFixedThreadPool(ranges.size(), task -> {
-                    Thread thread = new Thread(task, "NeoForbric-Segment-" + THREAD_IDS.incrementAndGet());
+                    Thread thread = new Thread(task, com.deepseek.neoforbric.core.BuildInfo.name() + "-Segment-" + THREAD_IDS.incrementAndGet());
                     thread.setDaemon(true);
                     return thread;
                 });

@@ -28,7 +28,8 @@ public final class NeoForbricMod {
     }
 
     public NeoForbricMod(IEventBus modEventBus, ModContainer modContainer) {
-        BodyLog.game("NeoForbric %s ready (total startup overhead %s)",
+        BodyLog.displayName(modContainer.getModInfo().getDisplayName());
+        BodyLog.game("%s %s ready (total startup overhead %s)", BodyLog.tag(),
                 modContainer.getModInfo().getVersion(), sinceJvmStart());
         BodyLog.info("body loaded: version=%s", modContainer.getModInfo().getVersion());
         BodyLog.info("jvm->modConstruct: %s", sinceJvmStart());

@@ -36,8 +36,15 @@ public final class PortMap {
 
 
     public enum Source {
-        ANY, MODRINTH, CURSEFORGE
+        ANY, MODRINTH, CURSEFORGE;
+
+        public boolean supported() {
+            return this != CURSEFORGE;
+        }
     }
+
+
+    public record Unsupported(String modId, String project) {}
 
 
     public record Target(String project, Source source) {}
@@ -114,6 +121,19 @@ public final class PortMap {
 
     public List<Port> all() {
         return List.copyOf(ports.values());
+    }
+
+
+    public List<Unsupported> unsupportedTargets() {
+        List<Unsupported> result = new ArrayList<>();
+        for (Port port : ports.values()) {
+            for (Target target : port.targets()) {
+                if (!target.source().supported()) {
+                    result.add(new Unsupported(port.modId(), target.project()));
+                }
+            }
+        }
+        return result;
     }
 
 
@@ -273,11 +293,15 @@ public final class PortMap {
 
     private static String renderTemplate(Properties builtin) {
         StringBuilder sb = new StringBuilder();
-        sb.append("# NeoForbric port map (whitelist). Changes take effect after restarting the game.\n");
+        sb.append("# ").append(ForbricLog.TAG).append(" (formerly NeoForbric) port map (whitelist)."
+                + " Changes take effect after restarting the game.\n");
         sb.append("#\n");
         sb.append("# One entry per line: <source modid> = <target>[,<target>...][@<expected modid>]\n");
-        sb.append("#   target: a bare number is a CurseForge project id, anything else is a Modrinth\n");
-        sb.append("#           id or slug; cf: / mr: pick the source, any: searches the whole chain.\n");
+        sb.append("#   target: a Modrinth project id or slug; mr: / modrinth: are accepted too, and\n");
+        sb.append("#           any: searches the whole source chain.\n");
+        sb.append("#   A bare number is a CurseForge project id. CurseForge access was removed in\n");
+        sb.append("#   0.0.10, so such a target is skipped with a warning: replace it with a Modrinth\n");
+        sb.append("#   id or slug, or delete the target. cf: and curseforge: are skipped the same way.\n");
         sb.append("#   Targets are tried in order, first hit wins.\n");
         sb.append("#   Without @, the expected modid is the source modid on the left of the equals sign.\n");
         sb.append("#\n");

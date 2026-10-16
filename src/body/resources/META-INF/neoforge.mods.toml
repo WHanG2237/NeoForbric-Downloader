@@ -5,7 +5,7 @@ license="MIT"
 [[mods]]
 modId="neoforbric"
 version="${version}"
-displayName="NeoForbric"
+displayName="${display_name}"
 authors="蓝色大肥鱼"
 # 图标路径是「相对本 jar 根目录」的，不是资源包那种 assets/... 路径。
 # 对照实测：Jade 写 logoFile="icon.png" 且文件就在 jar 根；JEI 写 logoFile="jei-icon.png" 同理。
@@ -13,9 +13,10 @@ authors="蓝色大肥鱼"
 # 所以文件放 src/body/resources/icon.png、这里写 "icon.png" 即可。
 logoFile="icon.png"
 description='''
-NeoForbric 万能转译加载器 —— 理论上兼容 Forge、Fabric、NeoForge 三大主流模组加载器。
-
-同一份 mods 文件夹里混装不同加载器的模组也能正常启动；需要时会自动补齐 Fabric 侧所需的组件。
+ModRelay（原名 NeoForbric，中文称呼「模组接力」）会在启动时查询官方 Modrinth API，下载对应的 NeoForge 构建并替换 mods 文件夹里的 Forge / Fabric 模组。
+它实际做的是查询、下载、校验、备份和替换，本身不是字节码转译器，也不能保证所有模组都能在 NeoForge 上运行；「转译」只是玩家可见的主题名。
+默认把被替换的原件备份到 mods/.neoforbric/backup/，失败时保留原件；改动 mods 文件夹并可能自动重启游戏，首次安装兼容层后需要重启一次。
+需要兼容层时会单独下载 Sinytra Connector 与 Forgified Fabric API。它们是第三方项目，版权与许可归其原作者，不受本项目 MIT 许可覆盖。
 '''
 
 [[dependencies.neoforbric]]

@@ -1,78 +1,75 @@
-# NeoForbric
+# ModRelay
 
-[中文说明](README.md)
+[简体中文](README.md) · [Download](https://github.com/WHanG2237/NeoForbric-Downloader/releases) · [Changelog](CHANGELOG.en.md)
 
-An automatic mod downloader and replacement tool for Minecraft **1.21.1 / NeoForge 21.1.x**. It identifies Forge and Fabric mods, looks for suitable NeoForge builds, and downloads and installs them when available.
+**Installed a mod for the wrong loader? Let ModRelay look for a compatible build.**
 
-The in-game interface presents this process as “translation.” The implementation queries repositories, downloads files, verifies them, and replaces files with backups. Sinytra Connector and Forgified Fabric API are downloaded separately when compatibility support is needed. **It cannot make every Forge or Fabric mod work on NeoForge.**
+ModRelay, formerly NeoForbric, is a mod download and replacement tool for **Minecraft 1.21.1 / NeoForge 21.1.x**. It detects Forge and Fabric mods in your instance, looks for suitable NeoForge builds, and downloads and installs the replacements.
 
-## Installation
+The in-game interface calls this process “translation.” Underneath, it performs lookups, downloads, verification, backups, and file replacement. For mods that still need a Fabric environment, it can install [Sinytra Connector](https://github.com/Sinytra/Connector) and [Forgified Fabric API](https://github.com/Sinytra/ForgifiedFabricAPI) as needed. It does not translate bytecode or guarantee that every combination of mods will work.
 
-1. Prepare a Minecraft 1.21.1 / NeoForge 21.1.x instance. Client checks use NeoForge 21.1.256.
+## Features
+
+- Find NeoForge builds for the current Minecraft version, with a mapping file for specifying ported projects.
+- Install missing required dependencies for newly installed mods.
+- Back up replaced originals by default and refuse to overwrite a different file with the same name.
+- Handle confirmed duplicates while keeping unresolved files and recording the reason.
+- Show startup and per-file download progress, with download results, average speeds, and a processing report.
+- Configure the mod in-game, including optional concurrent file downloads and segmented downloads within a file.
+
+A replacement may have a different version number from the original mod. If no suitable build is found or replacement fails, the original is kept; NeoForge may still be unable to load it.
+
+## Installation and upgrades
+
+1. Prepare a Minecraft 1.21.1 / NeoForge 21.1.x instance.
 2. Exit the game and back up the instance's `mods/` folder.
-3. Download `neoforbric-0.0.9.jar` from [Releases](https://github.com/WHanG2237/NeoForbric-Downloader/releases) and put it in `mods/`. If 0.0.9 is not listed yet, wait for its release; source availability does not mean a binary has been published.
-4. Start the game. Initial queries and downloads require a network connection.
+3. Download `neoforbric-<version>.jar` from [Releases](https://github.com/WHanG2237/NeoForbric-Downloader/releases) and place it in `mods/`.
+4. Start the game. Initial lookups and downloads require an internet connection.
 
-**Installing or enabling Connector / FFAPI for the first time still requires one restart.** NeoForbric normally starts it automatically. If the launcher blocks it, follow the message and restart manually. These components cannot be mounted dynamically in the same JVM.
+When upgrading, remove the old NeoForbric / ModRelay JAR to avoid duplicate loading. File names and configuration paths still use `neoforbric`, so existing settings and backups remain usable. GitHub's Source code archives and source ZIPs are for building the project; do not put them in `mods/`.
 
-GitHub's `Source code` archives and the source ZIP are for developers. Do not put them in `mods/`.
+**Installing or enabling Connector / FFAPI for the first time still requires a restart.** ModRelay attempts to restart automatically. If it cannot, follow the prompt to restart manually.
 
-## Behavior
+## Configuration and logs
 
-- Looks for NeoForge builds for the current Minecraft version.
-- Uses port mappings or separate compatibility components for Fabric mods when applicable.
-- Installs missing required dependencies for newly installed mods; optional dependencies are not installed automatically.
-- Backs up originals by default and refuses to overwrite a different file with the same name.
-- Records unfinished replacements and tries to recover them on the next start.
+Optionally install [Cloth Config](https://modrinth.com/mod/cloth-config) to open the settings through Mods → ModRelay → Config. Restart after changing settings. You can also edit the files directly:
 
-When no suitable build is available, the original is kept and the reason is reported. Keeping the original does not guarantee that NeoForge can load it. The available replacement may have a different mod version.
-
-## Configuration
-
-Install optional [Cloth Config](https://modrinth.com/mod/cloth-config) to use **Mods → NeoForbric → Configure**. Save and restart to apply changes. Without it, edit:
-
-| File | Purpose |
+| Path | Purpose |
 | --- | --- |
-| `config/neoforbric/config.properties` | Main switches, sources, downloads, restart settings |
-| `config/neoforbric/ports.properties` | Source mod IDs and preferred port projects |
-| `config/neoforbric/blacklist.properties` | Skip list of mod IDs to leave untouched |
+| `config/neoforbric/config.properties` | Download sources, concurrency, restart behavior, and other settings |
+| `config/neoforbric/ports.properties` | Mappings between mods and ported projects |
+| `config/neoforbric/blacklist.properties` | Skip list, identifying mods by modid |
+| `logs/neoforbric.log` | Lookup, download, and file operation logs |
+| `logs/neoforbric-report.json` | Processing report for the current startup |
+| `mods/.neoforbric/backup/` | Originals backed up during replacement and duplicate cleanup |
 
-Logs are in `logs/neoforbric.log`; the latest processing report is `logs/neoforbric-report.json`.
+By default, one file is processed at a time and segmented downloads are disabled. You can adjust concurrency or enable segments to suit your connection, but more connections do not necessarily mean faster downloads. Speed depends on the network, server, and available bandwidth.
 
-## Concurrent files and segmented downloads
+To restore a backup manually, exit the game first and check the files against the log. Do not delete backups, temporary files, or recovery records under `mods/.neoforbric/` while the game is running.
 
-Several files can download concurrently. Version 0.0.9 adds optional ranges within one file. It requires a suitable known size, a checksum, and valid HTTP Range support. All parts are verified and merged before the result is installed. Unsupported responses fall back to a single stream. Cancellation and an exhausted total deadline stop the download.
+## Download sources and compatibility
 
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `http.parallelism` | `8` | Concurrent file-processing tasks |
-| `http.segmented.enable` | `false` | Enable ranges within a file; off by default |
-| `http.segmented.maxSegments` | `4` | Maximum ranges per file |
-| `http.segmented.thresholdMb` | `16` | Minimum file size for attempting ranges |
-| `http.segmented.minSegmentMb` | `4` | Minimum target size of each range |
-| `http.maxActiveRequests` | `8` | Shared concurrent download request limit, including probes |
-| `http.maxRequestsPerHost` | `4` | Concurrent download request limit per host |
+The default source is the **official Modrinth API**. ModRelay queries projects and versions, then fetches files from the returned download addresses. Mods available only on other platforms may require manual installation. CurseForge access is not provided.
 
-Both forms of concurrency share the request limits. More connections do not increase an already saturated total bandwidth. Speed improvements depend on the server and network; no real-CDN speedup is promised.
+Third-party Modrinth mirrors are disabled by default. This project's registration and access scope for the built-in MCIM endpoint have not been confirmed. The User-Agent identifies ModRelay; it does not grant service authorization.
 
-The startup bar shows completed tasks in the **current stage** and resets when the stage changes. File status shows the current attempt and byte progress. Failed, skipped, and unchanged tasks also count as processed.
+ModRelay is available through [GitHub Releases](https://github.com/WHanG2237/NeoForbric-Downloader/releases). Connector, FFAPI, and other mods are downloaded separately rather than bundled with ModRelay. Their compatibility, copyright, and licenses remain with their respective projects.
 
-## Backups and recovery
+This is an experimental project. Replacing loader-specific builds cannot resolve every dependency in a modpack, so try it in a copy of your instance first. See [Known limitations](docs/KNOWN-LIMITATIONS.md) for more details.
 
-Original files are backed up under `mods/.neoforbric/backup/` by default. Temporary rollback files and `journal/` records help recover incomplete changes. They are not bundled copies of the compatibility layer. Do not remove them while the game is running. For manual recovery, exit the game first and check file identities and logs before restoring a backup.
+## Feedback and source
 
-Connector and FFAPI are independent downloads, not embedded in the NeoForbric JAR. Their compatibility remains subject to their upstream projects.
+Report problems through [Issues](https://github.com/WHanG2237/NeoForbric-Downloader/issues). Include the Minecraft / NeoForge versions, affected mods, reproduction steps, and relevant logs. Check for tokens and other sensitive information before uploading logs.
 
-## Limits, builds, and changes
-
-- [Known limitations](docs/KNOWN-LIMITATIONS.md)
 - [Build from source](docs/BUILD.md)
-- [Changelog](CHANGELOG.en.md) · [中文更新日志](CHANGELOG.md)
+- [English changelog](CHANGELOG.en.md) · [中文更新日志](CHANGELOG.md)
 
-The source version is **0.0.9**. Use Release assets and their checksum file to identify a published binary.
+## Author and AI contribution
 
-## Credits and license
+The maintainer supplied the concept, made feature decisions, and tested the user experience. DeepSeek produced most of the code, scripts, tests, and documentation, with Codex contributing reviews and some changes. “蓝色大肥鱼” is DeepSeek's project signature.
 
-Thanks to NeoForge, [Sinytra Connector](https://github.com/Sinytra/Connector), Forgified Fabric API, Modrinth, CurseForge, MCIM, and the mod authors. Repository and mirror availability is outside this project's control. Downloads remain subject to the platforms' and authors' terms. Third-party components retain their own copyright and licenses.
+Thanks to NeoForge, Sinytra Connector, Forgified Fabric API, Modrinth, and the mod authors.
 
-NeoForbric source is distributed under the [MIT License](LICENSE).
+## License
+
+Project code is available under the [MIT License](LICENSE). The Gradle Wrapper distributed with the source uses Apache-2.0; see [Third-party notices](THIRD-PARTY.en.md). The icon's permission status and attribution are documented in [ICON-LICENSE.md](ICON-LICENSE.md); the code's MIT license does not apply to it. Mods downloaded at runtime retain their own licenses.

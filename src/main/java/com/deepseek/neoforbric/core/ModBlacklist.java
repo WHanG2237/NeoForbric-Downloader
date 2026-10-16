@@ -190,7 +190,8 @@ public final class ModBlacklist {
 
     private static String renderTemplate() {
         StringBuilder sb = new StringBuilder();
-        sb.append("# NeoForbric blacklist. Changes take effect after restarting the game.\n");
+        sb.append("# ").append(ForbricLog.TAG).append(" (formerly NeoForbric) blacklist. Changes take"
+                + " effect after restarting the game.\n");
         sb.append("#\n");
         sb.append("# One modid per line; `modid = note` also works (the note is for humans only).\n");
         sb.append("# Case insensitive; blank lines and lines starting with # or ! are ignored.\n");

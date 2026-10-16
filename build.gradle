@@ -110,7 +110,9 @@ def expandProps = [
         'mod_id'        : project.archives_base_name,
         'mc_version'    : project.minecraft_version,
         'neoforge_range': '[21.1.0,21.2)',
-        'connector_version': project.connector_version
+        'connector_version': project.connector_version,
+        'display_name'  : project.mod_display_name,
+        'homepage'      : project.mod_homepage
 ]
 
 processResources {
@@ -128,20 +130,6 @@ processBodyResources {
     }
 }
 
-// 内层「模组本体」jar
-tasks.register('bodyJar', Jar) {
-    dependsOn tasks.named('processBodyResources')
-    archiveFileName = 'neoforbric-body.jar'
-    destinationDirectory = layout.buildDirectory.dir('body')
-    from sourceSets.body.output
-    manifest {
-        attributes(
-                'Implementation-Title'  : 'neoforbric-body',
-                'Implementation-Version': project.version
-        )
-    }
-}
-
 /*
  * 本 jar 只有两个职责：
  *   1) 作为 FML 服务层的「定位器」—— 声明 IModFileCandidateLocator，抢在 mods 扫描前干活；
@@ -153,11 +141,49 @@ tasks.register('bodyJar', Jar) {
  * 重启不可用（闸门不通过 / 子进程没起来）时降级成 NeoForge 错误界面，明确告诉玩家手动重启。
  * 详见 docs/15-脱离信雅互联本体-可行性.md。
  */
+
+/*
+ * 许可与署名材料必须随实际分发物一起走，不能只留在维护文档里：
+ *   - 外层 jar 是玩家装进 mods/ 的那个文件；
+ *   - 内层 body jar 会在运行时被解包到 mods/.neoforbric/，是玩家磁盘上真实存在的独立文件。
+ * 两者都放一份，任何单独被拿走的产物都自带许可与署名。
+ *
+ * 注意：这里引用的是仓库根目录下已经提交的文件（不是构建期生成的），
+ * 所以 GitHub 自动源码包与自制源码 ZIP 里也有同样的材料。
+ */
+def licenseFiles = ['LICENSE', 'THIRD-PARTY.md', 'THIRD-PARTY.en.md', 'ICON-LICENSE.md']
+
+// 内层「模组本体」jar
+tasks.register('bodyJar', Jar) {
+    dependsOn tasks.named('processBodyResources')
+    archiveFileName = 'neoforbric-body.jar'
+    destinationDirectory = layout.buildDirectory.dir('body')
+    from sourceSets.body.output
+    from(licenseFiles) {
+        into 'META-INF/licenses'
+    }
+    from('licenses') {
+        into 'META-INF/licenses'
+    }
+    manifest {
+        attributes(
+                'Implementation-Title'  : 'neoforbric-body',
+                'Implementation-Version': project.version
+        )
+    }
+}
+
 jar {
     dependsOn tasks.named('bodyJar')
     // 把内层 jar 作为资源嵌进外层 jar
     from(tasks.named('bodyJar')) {
         into 'META-INF/neoforbric'
+    }
+    from(licenseFiles) {
+        into 'META-INF/licenses'
+    }
+    from('licenses') {
+        into 'META-INF/licenses'
     }
     manifest {
         attributes(

@@ -466,7 +466,8 @@ public final class GameRelauncher {
     private static void writeState(Path modsDir, int count, long childPid, List<String> command) {
         Path file = stateFile(modsDir);
         StringBuilder sb = new StringBuilder();
-        sb.append("# written by the NeoForbric auto-restart (loop guard + diagnostics)").append(System.lineSeparator());
+        sb.append("# written by the ").append(ForbricLog.TAG).append(" auto-restart (loop guard + diagnostics)")
+.append(System.lineSeparator());
         sb.append("count=").append(count).append(System.lineSeparator());
         sb.append("at=").append(System.currentTimeMillis()).append(System.lineSeparator());
         sb.append("parentPid=").append(ProcessHandle.current().pid()).append(System.lineSeparator());

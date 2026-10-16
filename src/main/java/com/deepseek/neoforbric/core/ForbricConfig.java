@@ -31,15 +31,18 @@ public final class ForbricConfig {
 
 
     private static final String[][] REMOVED_KEYS = {
-        {"strict.failFast", "removed in 0.0.7: an unresolvable mod is now kept and reported by NeoForge itself"},
+        {"strict.failFast", "removed in 0.0.7: an unresolvable mod is now kept and reported by NeoForge itself", ""},
+        {"source.curseforge.enable", "removed in 0.0.10: CurseForge access was removed", ""},
+        {"source.curseforge.api", "removed in 0.0.10: CurseForge access was removed", ""},
+        {"source.curseforge.apiKey", "removed in 0.0.10: CurseForge access was removed", "secret"},
     };
 
     private static final String TEMPLATE = """
-            # NeoForbric configuration
+            # ModRelay configuration (modid and folder names stay "neoforbric")
             # Changes take effect after restarting the game.
             # This folder also holds ports.properties (whitelist) and blacklist.properties.
 
-            # Master switch. false = NeoForbric does nothing at all.
+            # Master switch. false = ModRelay does nothing at all.
             enable=true
 
             # --- Fabric mods ---
@@ -78,8 +81,9 @@ public final class ForbricConfig {
             http.downloadTimeoutSeconds=600
             # Attempts per source.
             http.retries=3
-            # Parallel downloads (values below 2 are treated as 2, above 128 as 128).
-            http.parallelism=8
+            # File processing tasks running at once (1-128). One at a time is the default: this connection
+            # gets slower, not faster, when two large files are fetched together.
+            http.parallelism=1
             # Seconds without a single byte before the download is cut and resumed (0 = off).
             http.stallTimeoutSeconds=45
             # Seconds allowed for one file in total, retries included (0 = unlimited).
@@ -88,33 +92,46 @@ public final class ForbricConfig {
             http.resumeKeepDays=3
             # Size limit for unfinished downloads, in MB (0 = unlimited).
             http.resumeCacheMaxMb=500
-            # Download one large file in several parallel ranges. Off by default.
+            # Download eligible large files using parallel ranges. Off by default: ranges add requests and
+            # only help when the server really serves each range at full speed. Ranges now follow the same
+            # address order as a single stream, so switching this on no longer pins the download to the
+            # slowest address.
             http.segmented.enable=false
-            # Ranges per file when segmented download is on (2-4).
-            http.segmented.maxSegments=4
+            # Maximum ranges per file (2-8).
+            http.segmented.maxSegments=2
             # Only files at least this large, in MB, are split into ranges.
             http.segmented.thresholdMb=16
             # Smallest range, in MB; the file is split into fewer ranges when it would be smaller.
             http.segmented.minSegmentMb=4
             # Download requests allowed at the same time across all files, probes included (2-64).
-            http.maxActiveRequests=8
+            http.maxActiveRequests=4
             # Download requests allowed at the same time towards one host (1-32).
             http.maxRequestsPerHost=4
             # Days a "no build found" result is trusted before the sources are asked again.
             cache.notFoundDays=7
 
             # --- Sources ---
-            # Try mirrors when the official source fails or times out.
+            # Try official alternate addresses (for example an alternate official CDN) when one fails.
             mirror.enable=true
-            # CurseForge lookups; the official endpoint needs an API key.
-            source.curseforge.enable=true
-            source.curseforge.api=https://mod.mcimirror.top/curseforge/v1
-            source.curseforge.apiKey=
-            # Modrinth lookups: mirror first, official API as the fallback.
-            source.modrinth.mirror.enable=true
-            source.modrinth.mirror.api=https://mod.mcimirror.top/modrinth/v2
+            # Third-party endpoints are separate switches and are off by default.
+            mirror.thirdparty.modrinth.enable=false
+            mirror.thirdparty.github.enable=false
+            # Modrinth official API is the default and only built-in source.
             source.modrinth.official.enable=true
+            # Any absolute http/https address here is used as your own endpoint. Addresses of services this
+            # build removed (CurseForge) are refused in every slot. The community MCIM mirror counts as
+            # third-party here too: it is refused in this slot unless mirror.thirdparty.modrinth.enable and
+            # source.modrinth.mirror.enable are both on, and it is then labelled a third-party mirror, never
+            # official. The check covers the addresses written in this file; a mod file is downloaded from the
+            # address the API reports and HTTP redirects are followed, so a proxy can still point those
+            # elsewhere. Unknown proxies are not vouched for.
             source.modrinth.official.api=https://api.modrinth.com/v2
+            # A third-party Modrinth endpoint; only used when both this and the switch above are on.
+            # The default is the community MCIM mirror. It stays off by default: this project's
+            # registration with that service is still being confirmed, and its terms are not
+            # confirmed here. Addresses of services this build removed (CurseForge) are refused.
+            source.modrinth.mirror.enable=false
+            source.modrinth.mirror.api=https://mod.mcimirror.top/modrinth/v2
 
             # --- Search, dependencies, duplicates ---
             # Search the repositories when the port map and the same-version build both missed.
@@ -129,6 +146,10 @@ public final class ForbricConfig {
             duplicates.removeRedundant=true
 
             # --- Debug ---
+            # Show one live progress row per active file during startup.
+            progress.files=true
+            # Record task counters and periodic file throughput in the instance log.
+            debug.progress=false
             # Milliseconds the loading screen stays visible.
             startup.stallMs=1200
             # Mods hidden from the mod list, by modid. Built-in rules always apply.
@@ -310,7 +331,7 @@ public final class ForbricConfig {
                 ForbricLog.info("config timeouts migrated to seconds: %s", renamed);
             }
             if (!dropped.isEmpty()) {
-                ForbricLog.info("config keys removed by this build, dropped: %s", dropped);
+                ForbricLog.info("old config keys this build no longer uses, dropped: %s", dropped);
             }
         } catch (IOException | RuntimeException e) {
             ForbricLog.warn("old config file unreadable, built-in defaults will be used: %s", e.toString());
@@ -390,7 +411,10 @@ public final class ForbricConfig {
                     if (!key.equals(pair[0])) {
                         continue;
                     }
-                    lines.set(i, "# " + pair[0] + "=" + raw + "  # " + pair[1]);
+                    String comment = pair.length > 2 && "secret".equals(pair[2])
+                            ? "# " + pair[0] + "=  # " + pair[1] + "; the stored value was dropped, not copied"
+                            : "# " + pair[0] + "=" + raw + "  # " + pair[1];
+                    lines.set(i, comment);
                     removed.add(pair[0]);
                     changed = true;
                 }
@@ -409,7 +433,10 @@ public final class ForbricConfig {
                 ForbricLog.info("config timeouts migrated to seconds: %s", migrated);
             }
             if (!removed.isEmpty()) {
-                ForbricLog.info("config keys removed by this build, commented out: %s", removed);
+                ForbricLog.info("config keys this build no longer uses, ignored and commented out: %s."
+                        + " CurseForge access was removed in 0.0.10, so nothing is queried or downloaded there any"
+                        + " more; a stored CurseForge key was dropped instead of being copied. The rest of the file"
+                        + " was not changed.", removed);
             }
         } catch (IOException | RuntimeException e) {
             ForbricLog.warn("config migration skipped: %s", e.toString());

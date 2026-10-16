@@ -1,14 +1,16 @@
 package com.deepseek.neoforbric.core;
 
 import com.deepseek.neoforbric.net.Http;
-import com.deepseek.neoforbric.net.CurseForgeSource;
 import com.deepseek.neoforbric.net.MatchKind;
+import com.deepseek.neoforbric.net.Mirrors;
 import com.deepseek.neoforbric.net.ModSource;
 import com.deepseek.neoforbric.net.ModrinthSource;
 import com.deepseek.neoforbric.net.QueryResult;
+import com.deepseek.neoforbric.net.RefusedSource;
 import com.deepseek.neoforbric.net.RequestLimiter;
 import com.deepseek.neoforbric.net.SegmentedDownload;
 import com.deepseek.neoforbric.net.TranspileTarget;
+import com.deepseek.neoforbric.net.UnavailableSource;
 import com.deepseek.neoforbric.net.VersionCandidate;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -31,6 +33,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -43,13 +46,9 @@ import net.neoforged.fml.ModLoadingIssue;
 
 public final class TranspileEngine {
 
-    private static final String CURSEFORGE_MIRROR = "https://mod.mcimirror.top/curseforge/v1";
-
-    private static final String CURSEFORGE_OFFICIAL = "https://api.curseforge.com/v1";
-
-    private static final String MODRINTH_MIRROR = "https://mod.mcimirror.top/modrinth/v2";
-
     private static final String MODRINTH_OFFICIAL = "https://api.modrinth.com/v2";
+
+    private static final String MODRINTH_MIRROR = "https://" + Mirrors.MCIM_HOST + "/modrinth/v2";
 
 
     public static final String WORK_DIR = ".neoforbric";
@@ -140,6 +139,8 @@ public final class TranspileEngine {
 
     private final List<ModSource> sources;
 
+    private final ComponentQuery componentQuery;
+
     private final ModrinthSource modrinthForDependencies;
     private final ExecutorService pool;
     private final String buildVersion;
@@ -198,10 +199,10 @@ public final class TranspileEngine {
         this.removeRedundant = config.getBool("duplicates.removeRedundant", true);
 
 
-        int maxActiveRequests = Math.min(64, Math.max(2, config.getInt("http.maxActiveRequests", 8)));
+        int maxActiveRequests = Math.min(64, Math.max(2, config.getInt("http.maxActiveRequests", 4)));
         int maxRequestsPerHost = Math.min(32, Math.max(1, config.getInt("http.maxRequestsPerHost", 4)));
         boolean segmentedEnabled = config.getBool("http.segmented.enable", false);
-        int maxSegments = Math.min(4, Math.max(2, config.getInt("http.segmented.maxSegments", 4)));
+        int maxSegments = Math.min(8, Math.max(2, config.getInt("http.segmented.maxSegments", 2)));
         int thresholdMb = Math.max(1, config.getInt("http.segmented.thresholdMb", 16));
         int minSegmentMb = Math.max(1, config.getInt("http.segmented.minSegmentMb", 4));
         SegmentedDownload.Settings segmentedSettings = new SegmentedDownload.Settings(segmentedEnabled, maxSegments,
@@ -212,60 +213,147 @@ public final class TranspileEngine {
         this.http = new Http(config.getInt("http.connectTimeoutMs", 8000),
                 config.getInt("http.readTimeoutMs", 20000),
                 config.getSecondsAsMillis("http.downloadTimeoutSeconds", 600), config.getInt("http.retries", 3),
-                config.getBool("mirror.enable", true), this::progressMessage,
+                mirrorPolicy(), this::progressMessage,
                 config.getSecondsAsMillis("http.stallTimeoutSeconds", 45),
                 config.getSecondsAsMillis("http.totalDeadlineSeconds", 600),
-                segmentedSettings, new RequestLimiter(maxActiveRequests, maxRequestsPerHost));
+                segmentedSettings, new RequestLimiter(maxActiveRequests, maxRequestsPerHost),
+                config.getBool("debug.progress", false));
         ThreadFactory factory = new ThreadFactory() {
             private final AtomicInteger counter = new AtomicInteger();
 
             @Override
             public Thread newThread(Runnable runnable) {
-                Thread thread = new Thread(runnable, "NeoForbric-Download-" + counter.incrementAndGet());
+                Thread thread = new Thread(runnable, ForbricLog.TAG + "-Download-" + counter.incrementAndGet());
                 thread.setDaemon(true);
                 return thread;
             }
         };
 
 
-        int parallelism = Math.min(128, Math.max(2, config.getInt("http.parallelism", 8)));
-        if (parallelism != config.getInt("http.parallelism", 8)) {
+        int parallelism = Math.min(128, Math.max(1, config.getInt("http.parallelism", 1)));
+        if (parallelism != config.getInt("http.parallelism", 1)) {
             ForbricLog.warn("http.parallelism=%d is out of range, using %d",
-                    config.getInt("http.parallelism", 8), parallelism);
+                    config.getInt("http.parallelism", 1), parallelism);
         }
         this.pool = Executors.newFixedThreadPool(parallelism, factory);
-        this.sources = buildSourceChain(http, gameVersion);
-
-
-        String depApi = MODRINTH_OFFICIAL;
-        String depLabel = "Modrinth official";
-        if (!config.getBool("source.modrinth.official.enable", true)
-                && config.getBool("source.modrinth.mirror.enable", true)) {
-            depApi = config.get("source.modrinth.mirror.api", MODRINTH_MIRROR);
-            depLabel = "Modrinth mirror";
+        ForbricLog.info("download settings: files=%d, segmented=%s, segments=%d, globalRequests=%d, hostRequests=%d",
+                parallelism, segmentedEnabled, maxSegments, maxActiveRequests, maxRequestsPerHost);
+        boolean thirdPartyAllowed = config.getBool("mirror.thirdparty.modrinth.enable", false)
+                && config.getBool("source.modrinth.mirror.enable", false);
+        Mirrors.Endpoint officialEndpoint = Mirrors.classify("source.modrinth.official.api", Mirrors.Slot.OFFICIAL,
+                config.get("source.modrinth.official.api", MODRINTH_OFFICIAL), thirdPartyAllowed);
+        Mirrors.Endpoint userEndpoint = mirrorEndpoint(thirdPartyAllowed);
+        this.sources = buildSourceChain(http, gameVersion, officialEndpoint, userEndpoint);
+        this.componentQuery = componentQuery(officialEndpoint, userEndpoint);
+        this.modrinthForDependencies = componentQuery.allowed()
+                ? new ModrinthSource(http, gameVersion, componentQuery.url(), componentQuery.label())
+                : null;
+        if (!componentQuery.allowed()) {
+            ForbricLog.warn("%s", componentQuery.refusal());
         }
-        this.modrinthForDependencies = new ModrinthSource(http, gameVersion, depApi, depLabel);
     }
 
 
-    private List<ModSource> buildSourceChain(Http http, String gameVersion) {
-        List<ModSource> chain = new ArrayList<>();
-        if (config.getBool("source.curseforge.enable", true)) {
-            chain.add(new CurseForgeSource(http, gameVersion,
-                    config.get("source.curseforge.api", CURSEFORGE_MIRROR), "CurseForge mirror", null));
-            String key = config.get("source.curseforge.apiKey", "");
-            if (!key.isBlank()) {
+    private Mirrors.Policy mirrorPolicy() {
+        return new Mirrors.Policy(config.getBool("mirror.enable", true),
+                config.getBool("mirror.thirdparty.modrinth.enable", false),
+                config.getBool("mirror.thirdparty.github.enable", false));
+    }
 
-                chain.add(new CurseForgeSource(http, gameVersion, CURSEFORGE_OFFICIAL, "CurseForge official", key));
+
+    private Mirrors.Endpoint mirrorEndpoint(boolean thirdPartyAllowed) {
+        if (!config.getBool("source.modrinth.mirror.enable", false)) {
+            return null;
+        }
+        String url = config.get("source.modrinth.mirror.api", MODRINTH_MIRROR).trim();
+        if (url.isEmpty()) {
+            ForbricLog.warn("source.modrinth.mirror.enable is on but source.modrinth.mirror.api is empty, so only"
+                    + " the official Modrinth API is used. Set that key to the endpoint you want, or set"
+                    + " source.modrinth.mirror.enable off.");
+            return null;
+        }
+        if (!config.getBool("mirror.thirdparty.modrinth.enable", false)) {
+            Mirrors.Endpoint probe = Mirrors.classify("source.modrinth.mirror.api", Mirrors.Slot.MIRROR, url, false);
+            if (probe.refused()) {
+                ForbricLog.warn("source.modrinth.mirror.enable is on but mirror.thirdparty.modrinth.enable is off, so no"
+                        + " third-party Modrinth endpoint is contacted. Turn the third-party switch on to accept that"
+                        + " endpoint, or set source.modrinth.mirror.enable off.");
+                ForbricLog.warn("%s", probe.refusal());
+                return probe;
+            }
+            ForbricLog.warn("source.modrinth.mirror.enable is on but mirror.thirdparty.modrinth.enable is off, so no"
+                    + " third-party Modrinth endpoint is contacted. Turn the third-party switch on to accept that"
+                    + " endpoint, or set source.modrinth.mirror.enable off.");
+            return null;
+        }
+        Mirrors.Endpoint endpoint = Mirrors.classify("source.modrinth.mirror.api", Mirrors.Slot.MIRROR, url,
+                thirdPartyAllowed);
+        if (endpoint.refused()) {
+            ForbricLog.warn("%s", endpoint.refusal());
+            return endpoint;
+        }
+        return endpoint;
+    }
+
+
+    private record ComponentQuery(String url, String label, String refusal) {
+
+        boolean allowed() {
+            return refusal == null;
+        }
+    }
+
+
+    private ComponentQuery componentQuery(Mirrors.Endpoint official, Mirrors.Endpoint userEndpoint) {
+        boolean officialEnabled = config.getBool("source.modrinth.official.enable", true);
+        if (officialEnabled && official.allowed()) {
+            return componentFrom(Mirrors.classify("source.modrinth.official.api", Mirrors.Slot.COMPONENT,
+                    MODRINTH_OFFICIAL, false));
+        }
+        if (userEndpoint != null) {
+            return componentFrom(userEndpoint);
+        }
+        if (officialEnabled) {
+            return new ComponentQuery(null, official.label(), "the connector and Forgified Fabric API queries follow"
+                    + " the same endpoint policy as the mod sources, so they are refused as well: "
+                    + official.refusal());
+        }
+        return componentFrom(Mirrors.classify("source.modrinth.official.api", Mirrors.Slot.COMPONENT, MODRINTH_OFFICIAL,
+                false));
+    }
+
+
+    private static ComponentQuery componentFrom(Mirrors.Endpoint endpoint) {
+        return endpoint.allowed()
+                ? new ComponentQuery(endpoint.url(), endpoint.label(), null)
+                : new ComponentQuery(null, endpoint.label(), endpoint.refusal());
+    }
+
+
+    private List<ModSource> buildSourceChain(Http http, String gameVersion, Mirrors.Endpoint official,
+            Mirrors.Endpoint userEndpoint) {
+        List<ModSource> chain = new ArrayList<>();
+        if (config.getBool("source.modrinth.official.enable", true)) {
+            if (official.allowed()) {
+                chain.add(new ModrinthSource(http, gameVersion, official.url(), official.label()));
+            } else {
+                ForbricLog.warn("%s", official.refusal());
+                chain.add(new RefusedSource(official.key(), official.refusal()));
             }
         }
-        if (config.getBool("source.modrinth.mirror.enable", true)) {
-            chain.add(new ModrinthSource(http, gameVersion,
-                    config.get("source.modrinth.mirror.api", MODRINTH_MIRROR), "Modrinth mirror"));
+        if (userEndpoint != null) {
+            if (userEndpoint.allowed()) {
+                chain.add(new ModrinthSource(http, gameVersion, userEndpoint.url(), userEndpoint.label()));
+            } else {
+                chain.add(new RefusedSource(userEndpoint.key(), userEndpoint.refusal()));
+            }
         }
-        if (config.getBool("source.modrinth.official.enable", true)) {
-            chain.add(new ModrinthSource(http, gameVersion,
-                    config.get("source.modrinth.official.api", MODRINTH_OFFICIAL), "Modrinth official"));
+        if (chain.isEmpty()) {
+            String reason = "no download source is enabled, so nothing was queried and no mod can be replaced this"
+                    + " round. Turn source.modrinth.official.enable back on, or enable a mirror endpoint, then try"
+                    + " again. This is a configuration problem, not a missing build.";
+            ForbricLog.warn("%s", reason);
+            chain.add(new UnavailableSource(reason));
         }
         ForbricLog.debug("sources: %s", chain.stream().map(ModSource::name).toList());
         return chain;
@@ -274,8 +362,18 @@ public final class TranspileEngine {
 
     private QueryResult<TranspileTarget> findInChain(ModJarInfo jar, boolean fallbackToLatest, String sha1) {
         QueryResult<TranspileTarget> uncertain = null;
+        QueryResult<TranspileTarget> unusable = null;
+        boolean anyUsable = false;
         for (int i = 0; i < sources.size(); i++) {
             ModSource source = sources.get(i);
+            if (!usable(source)) {
+                if (unusable == null) {
+                    unusable = unusableResult(source);
+                }
+                ForbricLog.debug("  %s is refused or unavailable; no request is sent", source.name());
+                continue;
+            }
+            anyUsable = true;
             try {
                 QueryResult<TranspileTarget> found = source.find(jar, fallbackToLatest, sha1, crawlStrict);
                 if (found.hasValue()) {
@@ -297,7 +395,26 @@ public final class TranspileEngine {
         if (uncertain != null) {
             return uncertain;
         }
+        if (!anyUsable && unusable != null) {
+            return unusable;
+        }
         return QueryResult.notFound("no source has a NeoForge build for " + jar.fileName());
+    }
+
+
+    private static boolean usable(ModSource source) {
+        return !(source instanceof RefusedSource) && !(source instanceof UnavailableSource);
+    }
+
+
+    private static QueryResult<TranspileTarget> unusableResult(ModSource source) {
+        if (source instanceof RefusedSource refused) {
+            return QueryResult.restricted(refused.reason());
+        }
+        if (source instanceof UnavailableSource unavailable) {
+            return QueryResult.configError(unavailable.reason());
+        }
+        return QueryResult.temporary("source " + source.name() + " is not available");
     }
 
 
@@ -310,7 +427,17 @@ public final class TranspileEngine {
             }
         }
         QueryResult<TranspileTarget> uncertain = null;
+        QueryResult<TranspileTarget> unusable = null;
+        boolean anyUsable = false;
         for (ModSource source : sources) {
+            if (!usable(source)) {
+                if (unusable == null) {
+                    unusable = unusableResult(source);
+                }
+                ForbricLog.debug("  %s is refused or unavailable; no request is sent", source.name());
+                continue;
+            }
+            anyUsable = true;
             for (String slug : candidates) {
                 try {
                     QueryResult<TranspileTarget> found = source.latest(slug, ModrinthSource.LOADER_NEOFORGE);
@@ -331,17 +458,34 @@ public final class TranspileEngine {
         if (uncertain != null) {
             return uncertain;
         }
+        if (!anyUsable && unusable != null) {
+            return unusable;
+        }
         return QueryResult.notFound("no NeoForge build for " + projectSpec);
     }
 
 
     private QueryResult<TranspileTarget> latestInChain(List<PortMap.Target> targets) {
         QueryResult<TranspileTarget> uncertain = null;
+        QueryResult<TranspileTarget> unusable = null;
+        boolean anyUsable = false;
+        int skipped = 0;
         for (PortMap.Target target : targets) {
+            if (!target.source().supported()) {
+                skipped++;
+                continue;
+            }
             for (ModSource source : sources) {
                 if (!accepts(source, target.source())) {
                     continue;
                 }
+                if (!usable(source)) {
+                    if (unusable == null) {
+                        unusable = unusableResult(source);
+                    }
+                    continue;
+                }
+                anyUsable = true;
                 try {
                     QueryResult<TranspileTarget> found = source.latest(target.project(), ModrinthSource.LOADER_NEOFORGE);
                     if (found.hasValue()) {
@@ -362,6 +506,12 @@ public final class TranspileEngine {
         if (uncertain != null) {
             return uncertain;
         }
+        if (!anyUsable && unusable != null) {
+            return unusable;
+        }
+        if (skipped == targets.size()) {
+            return QueryResult.notFound("the mapped target(s) name a source this build removed");
+        }
         return QueryResult.notFound("no NeoForge build for the mapped project");
     }
 
@@ -369,8 +519,9 @@ public final class TranspileEngine {
     private static boolean accepts(ModSource source, PortMap.Source want) {
         return switch (want) {
             case ANY -> true;
-            case MODRINTH -> source instanceof ModrinthSource;
-            case CURSEFORGE -> source instanceof CurseForgeSource;
+            case MODRINTH -> source instanceof ModrinthSource || source instanceof RefusedSource
+                    || source instanceof UnavailableSource;
+            case CURSEFORGE -> false;
         };
     }
 
@@ -388,7 +539,17 @@ public final class TranspileEngine {
 
     private QueryResult<TranspileTarget> crawlByModId(String modId, String displayName) {
         QueryResult<TranspileTarget> uncertain = null;
+        QueryResult<TranspileTarget> unusable = null;
+        boolean anyUsable = false;
         for (ModSource source : sources) {
+            if (!usable(source)) {
+                if (unusable == null) {
+                    unusable = unusableResult(source);
+                }
+                ForbricLog.debug("  %s is refused or unavailable; no request is sent", source.name());
+                continue;
+            }
+            anyUsable = true;
             try {
                 QueryResult<TranspileTarget> found = source.forModId(modId, displayName, crawlStrict);
                 if (found.hasValue()) {
@@ -406,6 +567,9 @@ public final class TranspileEngine {
         }
         if (uncertain != null) {
             return uncertain;
+        }
+        if (!anyUsable && unusable != null) {
+            return unusable;
         }
         return QueryResult.notFound("no project named " + modId + " on any source");
     }
@@ -428,7 +592,586 @@ public final class TranspileEngine {
     }
 
 
-    private void resolveDuplicates(Map<String, DuplicateJars.Conflict> duplicates) {
+    private record DuplicateReview(int removedRedundant, List<String> keptDuplicates, int nativeConflicts,
+            List<ModJarInfo> inventory) {}
+
+
+    private record OriginalSnapshot(String sha1, long size, ModKind kind, List<String> ids,
+            Map<String, String> versions) {}
+
+
+    private DuplicateReview resolveNativeOverlaps(Set<String> blacklistedFiles,
+            Map<String, DuplicateJars.Conflict> translatedDuplicates, Set<String> previouslyCovered) {
+        List<ModJarInfo> active = ModJarScanner.scan(modsDir);
+        DuplicateJars.Plan current = DuplicateJars.plan(active, TranspileEngine::sha1Of);
+        Map<String, OriginalSnapshot> snapshots = new LinkedHashMap<>();
+        for (DuplicateJars.NativeOverlap candidate : current.nativeOverlaps().values()) {
+            snapshots.put(candidate.jar().fileName(), snapshotOf(candidate.jar()));
+        }
+        List<String> kept = new ArrayList<>();
+        int removed = 0;
+        Set<String> stillCovered = new LinkedHashSet<>();
+        for (DuplicateJars.NativeOverlap overlap : current.nativeOverlaps().values()) {
+            ModJarInfo jar = overlap.jar();
+            stillCovered.add(jar.fileName());
+            if (blacklistedFiles.contains(jar.fileName())) {
+                continue;
+            }
+            List<ModJarInfo> present = new ArrayList<>();
+            for (ModJarInfo provider : overlap.providers()) {
+                if (!translatedDuplicates.containsKey(provider.fileName())) {
+                    present.add(provider);
+                }
+            }
+            List<ModJarInfo> providers = new ArrayList<>();
+            List<ModJarInfo> protectedProviders = new ArrayList<>();
+            for (ModJarInfo provider : present) {
+                if (isProtectedProvider(provider, blacklistedFiles)) {
+                    protectedProviders.add(provider);
+                } else {
+                    providers.add(provider);
+                }
+            }
+            List<String> reasons = new ArrayList<>(2);
+            if (!removeRedundant) {
+                reasons.add("duplicates.removeRedundant=false keeps every duplicate");
+            }
+            if (reasons.isEmpty() && present.isEmpty()) {
+                reasons.add("no native NeoForge file that provides " + overlap.describeIds() + " is in mods/ now");
+            }
+            if (reasons.isEmpty() && !overlap.uncoveredIds().isEmpty()) {
+                reasons.add("it also provides " + String.join("/", overlap.uncoveredIds())
+                        + ", which no native NeoForge file provides");
+            }
+            if (reasons.isEmpty()) {
+                List<String> missing = idsWithoutProvider(overlap.sharedIds(), providers);
+                if (!missing.isEmpty()) {
+                    List<String> blocked = idsWithProvider(missing, protectedProviders);
+                    if (!blocked.isEmpty() && blocked.size() == missing.size()) {
+                        reasons.add("the native file(s) that provide " + String.join("/", blocked)
+                                + " (also) provide a modid in the user blacklist ("
+                                + describeFileNames(protectedProviders) + ")");
+                    } else {
+                        reasons.add("no native NeoForge file that is in mods/ now provides "
+                                + String.join("/", missing));
+                    }
+                }
+            }
+            if (reasons.isEmpty()) {
+                reasons.addAll(versionReasons(active, overlap, providers));
+            }
+            if (!reasons.isEmpty()) {
+                kept.add(jar.fileName());
+                ForbricLog.warn("  duplicate not resolved: %s [%s %s, id=%s] at %s", jar.fileName(),
+                        jar.kind().display(), versionText(jar), idText(jar), jar.path());
+                ForbricLog.warn("    %s", String.join("; ", reasons));
+                ForbricLog.warn("    the same modid is provided by %s", describeProviders(present, overlap));
+                report(jar.fileName(), "unresolved-duplicate", "kept: " + String.join("; ", reasons)
+                        + "; same modid provided by " + describeProviders(present, overlap)
+                        + "; file at " + jar.path(), false);
+                continue;
+            }
+            if (removeRedundantOverlap(overlap, providers, snapshots.get(jar.fileName()))) {
+                removed++;
+            } else {
+                kept.add(jar.fileName());
+            }
+        }
+        for (String name : previouslyCovered) {
+            if (stillCovered.contains(name) || blacklistedFiles.contains(name)) {
+                continue;
+            }
+            Path path = modsDir.resolve(name);
+            if (!Files.isRegularFile(path)) {
+                continue;
+            }
+            ModJarInfo jar = inspectQuietly(path);
+            if (jar.kind() != ModKind.FORGE && jar.kind() != ModKind.FABRIC && jar.kind() != ModKind.QUILT) {
+                continue;
+            }
+            List<String> orphaned = new ArrayList<>();
+            for (String id : jar.allModIds()) {
+                if (id == null || id.isBlank()) {
+                    continue;
+                }
+                if (!current.nativeModIds().contains(id.toLowerCase(java.util.Locale.ROOT))) {
+                    orphaned.add(id);
+                }
+            }
+            String reason = "the native NeoForge file(s) that provided "
+                    + (orphaned.isEmpty() ? idText(jar) : String.join("/", orphaned))
+                    + " are no longer in mods/; nothing was moved for this file";
+            kept.add(name);
+            ForbricLog.warn("  duplicate not resolved: %s [%s %s, id=%s] at %s", name, jar.kind().display(),
+                    versionText(jar), idText(jar), path);
+            ForbricLog.warn("    %s", reason);
+            report(name, "unresolved-duplicate", "kept: " + reason + "; file at " + path, false);
+        }
+        List<ModJarInfo> inventory = ModJarScanner.scan(modsDir);
+        return new DuplicateReview(removed, List.copyOf(kept), reportNativeVersionConflicts(inventory),
+                List.copyOf(inventory));
+    }
+
+
+    private boolean isProtectedProvider(ModJarInfo provider, Set<String> blacklistedFiles) {
+        if (blacklistedFiles.contains(provider.fileName())) {
+            return true;
+        }
+        for (String id : provider.allModIds()) {
+            if (blacklist.contains(id)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
+    private static List<String> idsWithoutProvider(List<String> ids, List<ModJarInfo> providers) {
+        List<String> missing = new ArrayList<>();
+        for (String id : ids) {
+            if (id == null || id.isBlank()) {
+                continue;
+            }
+            boolean found = false;
+            for (ModJarInfo provider : providers) {
+                if (provider.provides(id)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                missing.add(id);
+            }
+        }
+        return missing;
+    }
+
+
+    private static List<String> idsWithProvider(List<String> ids, List<ModJarInfo> providers) {
+        List<String> covered = new ArrayList<>();
+        for (String id : ids) {
+            if (id == null || id.isBlank()) {
+                continue;
+            }
+            for (ModJarInfo provider : providers) {
+                if (provider.provides(id)) {
+                    covered.add(id);
+                    break;
+                }
+            }
+        }
+        return covered;
+    }
+
+
+    private static String describeFileNames(List<ModJarInfo> jars) {
+        StringBuilder sb = new StringBuilder();
+        for (ModJarInfo jar : jars) {
+            if (sb.length() > 0) {
+                sb.append("; ");
+            }
+            sb.append(jar.fileName());
+        }
+        return sb.length() == 0 ? "no file" : sb.toString();
+    }
+
+
+    private List<String> versionReasons(List<ModJarInfo> jars, DuplicateJars.NativeOverlap overlap,
+            List<ModJarInfo> providers) {
+        List<String> reasons = new ArrayList<>();
+        for (ModJarInfo other : jars) {
+            if (other.fileName().equals(overlap.jar().fileName())) {
+                continue;
+            }
+            for (DependencyRequirement requirement : ModDependencies.required(other.path())) {
+                String id = requirement.modId();
+                if (id == null || id.isBlank() || !overlap.jar().provides(id) || !requirement.hasVersionRange()) {
+                    continue;
+                }
+                boolean satisfied = false;
+                boolean unknown = false;
+                for (ModJarInfo provider : providers) {
+                    if (!provider.provides(id)) {
+                        continue;
+                    }
+                    String installed = provider.providedVersion(id);
+                    if (installed == null || installed.isBlank()) {
+                        unknown = true;
+                        continue;
+                    }
+                    VersionRange.Verdict verdict = VersionRange.check(installed, requirement.versionRange());
+                    if (verdict == VersionRange.Verdict.SATISFIED) {
+                        satisfied = true;
+                        break;
+                    }
+                    if (verdict == VersionRange.Verdict.UNKNOWN) {
+                        unknown = true;
+                    }
+                }
+                if (!satisfied) {
+                    reasons.add(other.fileName() + " requires " + id + " " + requirement.versionRange()
+                            + (unknown ? ", and the version of the native file that provides " + id
+                                    + " could not be confirmed"
+                                    : ", which the native file that provides " + id + " does not satisfy"));
+                    if (reasons.size() >= 2) {
+                        return reasons;
+                    }
+                }
+            }
+        }
+        return reasons;
+    }
+
+
+    private String describeProviders(List<ModJarInfo> providers, DuplicateJars.NativeOverlap overlap) {
+        if (providers.isEmpty()) {
+            return overlap.describeProviders();
+        }
+        StringBuilder sb = new StringBuilder();
+        for (ModJarInfo provider : providers) {
+            if (sb.length() > 0) {
+                sb.append("; ");
+            }
+            sb.append(provider.fileName()).append(" [").append(provider.kind().display()).append(' ')
+                    .append(providerVersionText(provider, overlap.sharedIds())).append(", id=")
+                    .append(idText(provider)).append("] at ").append(provider.path());
+        }
+        return sb.toString();
+    }
+
+
+    private static String providerVersionText(ModJarInfo provider, List<String> ids) {
+        StringBuilder sb = new StringBuilder();
+        for (String id : ids) {
+            if (!provider.provides(id)) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(", ");
+            }
+            String version = provider.providedVersion(id);
+            sb.append(id).append('=').append(version == null || version.isBlank() ? "unknown" : version);
+        }
+        return sb.length() == 0 ? "?" : sb.toString();
+    }
+
+
+    private static OriginalSnapshot snapshotOf(ModJarInfo jar) {
+        String sha1 = sha1Of(jar);
+        return new OriginalSnapshot(sha1 == null ? "" : sha1, jar.size(), jar.kind(), List.copyOf(jar.allModIds()),
+                Map.copyOf(jar.providedVersions()));
+    }
+
+
+    private static String originalProblem(Path path, OriginalSnapshot snapshot) {
+        if (snapshot == null) {
+            return "the file was not captured when the redundancy check ran, so it is kept";
+        }
+        if (snapshot.sha1().isBlank()) {
+            return "the file could not be read when the redundancy check ran, so it is kept";
+        }
+        try {
+            if (!Files.isRegularFile(path)) {
+                return "the file left mods/ before it could be moved";
+            }
+            ModJarInfo current = ModJarScanner.inspect(path);
+            if (current.kind() != snapshot.kind()) {
+                return "the file is now read as " + current.kind().display() + " instead of "
+                        + snapshot.kind().display();
+            }
+            List<String> added = idsMissing(current.allModIds(), snapshot.ids());
+            if (!added.isEmpty()) {
+                return "the file now also provides " + String.join("/", added)
+                        + ", which the redundancy check did not cover";
+            }
+            List<String> gone = idsMissing(snapshot.ids(), current.allModIds());
+            if (!gone.isEmpty()) {
+                return "the file no longer provides " + String.join("/", gone);
+            }
+            for (String id : snapshot.ids()) {
+                String before = versionOf(snapshot.versions(), id);
+                String now = current.providedVersion(id);
+                if (before == null ? now != null : !before.equals(now)) {
+                    return "the version reported for " + id + " changed (was "
+                            + (before == null || before.isBlank() ? "unknown" : before) + ", now "
+                            + (now == null || now.isBlank() ? "unknown" : now) + ")";
+                }
+            }
+            if (Files.size(path) != snapshot.size() || !snapshot.sha1().equals(Hashes.sha1(path))) {
+                return "the file changed after the redundancy check";
+            }
+            return null;
+        } catch (IOException e) {
+            return "the file could not be checked again (" + e + ")";
+        }
+    }
+
+
+    private static List<String> idsMissing(List<String> wanted, List<String> have) {
+        List<String> result = new ArrayList<>();
+        for (String id : wanted) {
+            if (id == null || id.isBlank()) {
+                continue;
+            }
+            boolean found = false;
+            for (String other : have) {
+                if (other != null && other.equalsIgnoreCase(id)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                result.add(id);
+            }
+        }
+        return result;
+    }
+
+
+    private static String versionOf(Map<String, String> versions, String id) {
+        for (Map.Entry<String, String> entry : versions.entrySet()) {
+            if (entry.getKey() != null && entry.getKey().equalsIgnoreCase(id)) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+
+    private String removalProblem(ModJarInfo jar, DuplicateJars.NativeOverlap overlap, List<ModJarInfo> providers,
+            OriginalSnapshot snapshot) {
+        String original = originalProblem(jar.path(), snapshot);
+        if (original != null) {
+            return original;
+        }
+        return providerProblem(overlap, providers);
+    }
+
+
+    private String providerProblem(DuplicateJars.NativeOverlap overlap, List<ModJarInfo> providers) {
+        try {
+            for (ModJarInfo provider : providers) {
+                if (!Files.isRegularFile(provider.path())) {
+                    return provider.fileName() + " is no longer in mods/";
+                }
+                ModJarInfo fresh = ModJarScanner.inspect(provider.path());
+                if (fresh.kind() != ModKind.NEOFORGE) {
+                    return provider.fileName() + " is not a readable NeoForge file any more";
+                }
+                for (String id : overlap.sharedIds()) {
+                    if (!provider.provides(id)) {
+                        continue;
+                    }
+                    if (!fresh.provides(id)) {
+                        return provider.fileName() + " no longer provides " + id;
+                    }
+                    String before = provider.providedVersion(id);
+                    String now = fresh.providedVersion(id);
+                    if (before == null ? now != null : !before.equals(now)) {
+                        return provider.fileName() + " now reports the version of " + id + " as "
+                                + (now == null || now.isBlank() ? "unknown" : now);
+                    }
+                }
+            }
+            return null;
+        } catch (IOException e) {
+            return "the native files could not be checked again (" + e + ")";
+        }
+    }
+
+
+    private boolean removeRedundantOverlap(DuplicateJars.NativeOverlap overlap, List<ModJarInfo> providers,
+            OriginalSnapshot snapshot) {
+        ModJarInfo jar = overlap.jar();
+        Path loser = jar.path();
+        if (!Files.isRegularFile(loser)) {
+            ForbricLog.info("  %s is no longer in mods/, nothing to remove", jar.fileName());
+            return true;
+        }
+        Path backup = workDir.resolve("backup").resolve(jar.fileName());
+        InstallJournal.Entry transaction;
+        try {
+            Files.createDirectories(backup.getParent());
+            transaction = journal.open(InstallJournal.Kind.REMOVE, loser, null, null, backup, null,
+                    snapshot == null ? "" : snapshot.sha1(), "");
+        } catch (IOException e) {
+            ForbricLog.error("  cannot remove the redundant duplicate " + jar.fileName(), e);
+            notes.add("redundant duplicate kept: " + jar.fileName() + " (" + e + ")");
+            report(jar.fileName(), "unresolved-duplicate", "kept: the removal could not be recorded (" + e + ")", false);
+            return false;
+        }
+        String problem = removalProblem(jar, overlap, providers, snapshot);
+        if (problem != null) {
+            journal.close(transaction);
+            ForbricLog.warn("  duplicate not resolved: %s: %s", jar.fileName(), problem);
+            notes.add("redundant duplicate kept: " + jar.fileName() + " (" + problem + ")");
+            report(jar.fileName(), "unresolved-duplicate", "kept: " + problem, false);
+            return false;
+        }
+        try {
+            Files.move(loser, backup, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            if (Files.isRegularFile(loser)) {
+                journal.close(transaction);
+            } else {
+                ForbricLog.warn("  %s left mods/ but the removal could not be confirmed: %s", jar.fileName(), e);
+            }
+            ForbricLog.error("  cannot remove the redundant duplicate " + jar.fileName(), e);
+            notes.add("redundant duplicate kept: " + jar.fileName() + " (" + e + ")");
+            report(jar.fileName(), "unresolved-duplicate", "kept: the file could not be moved to the backup ("
+                    + e + ")", false);
+            return false;
+        }
+        boolean gone = !Files.exists(loser);
+        boolean stored = Files.isRegularFile(backup);
+        if (!gone || !stored) {
+            ForbricLog.error("  the redundant duplicate %s was moved but the result could not be confirmed "
+                    + "(in mods/=%s, backup exists=%s)", jar.fileName(), !gone, stored);
+            notes.add("redundant duplicate state unclear: " + jar.fileName() + " (in mods/=" + !gone
+                    + ", backup=" + backup + ")");
+            report(jar.fileName(), "unresolved-duplicate", "state unclear after moving: in mods/=" + !gone
+                    + ", backup=" + backup, false);
+            return false;
+        }
+        journal.close(transaction);
+        ForbricLog.info("  removed the redundant duplicate %s [%s %s, id=%s] at %s", jar.fileName(),
+                jar.kind().display(), versionText(jar), idText(jar), loser);
+        ForbricLog.info("    every modid it provides (%s) is provided by %s", overlap.describeIds(),
+                describeProviders(providers, overlap));
+        ForbricLog.info("    the file is kept at %s", backup);
+        report(jar.fileName(), "removed-redundant", "every modid it provides (" + overlap.describeIds()
+                + ") is provided by " + describeProviders(providers, overlap) + "; moved to " + backup, false);
+        return true;
+    }
+
+
+    private int reportNativeVersionConflicts(List<ModJarInfo> active) {
+        Map<String, List<ModJarInfo>> byId = new LinkedHashMap<>();
+        for (ModJarInfo jar : active) {
+            if (jar.kind() != ModKind.NEOFORGE) {
+                continue;
+            }
+            for (String id : jar.allModIds()) {
+                if (id == null || id.isBlank()) {
+                    continue;
+                }
+                List<ModJarInfo> members = byId.computeIfAbsent(id.toLowerCase(java.util.Locale.ROOT),
+                        key -> new ArrayList<>());
+                if (!containsFile(members, jar.fileName())) {
+                    members.add(jar);
+                }
+            }
+        }
+        Map<String, ModJarInfo> conflicted = new LinkedHashMap<>();
+        Map<String, List<String>> idsOf = new LinkedHashMap<>();
+        Map<String, List<String>> othersOf = new LinkedHashMap<>();
+        Map<String, List<String>> unknownOf = new LinkedHashMap<>();
+        for (Map.Entry<String, List<ModJarInfo>> entry : byId.entrySet()) {
+            List<ModJarInfo> members = entry.getValue();
+            if (members.size() < 2) {
+                continue;
+            }
+            Map<String, String> hashOf = new LinkedHashMap<>();
+            Map<String, List<ModJarInfo>> byHash = new LinkedHashMap<>();
+            List<ModJarInfo> unreadable = new ArrayList<>();
+            for (ModJarInfo member : members) {
+                String hash = sha1Of(member);
+                hashOf.put(member.fileName(), hash);
+                if (hash == null || hash.isBlank()) {
+                    unreadable.add(member);
+                    continue;
+                }
+                byHash.computeIfAbsent(hash, key -> new ArrayList<>()).add(member);
+            }
+            if (!unreadable.isEmpty()) {
+                for (ModJarInfo member : unreadable) {
+                    List<String> ids = unknownOf.computeIfAbsent(member.fileName(), key -> new ArrayList<>());
+                    if (!ids.contains(entry.getKey())) {
+                        ids.add(entry.getKey());
+                    }
+                }
+                continue;
+            }
+            if (byHash.size() < 2) {
+                continue;
+            }
+            for (ModJarInfo member : members) {
+                String ownHash = hashOf.get(member.fileName());
+                for (ModJarInfo other : members) {
+                    if (other.fileName().equals(member.fileName())
+                            || (ownHash != null && ownHash.equals(hashOf.get(other.fileName())))) {
+                        continue;
+                    }
+                    conflicted.putIfAbsent(member.fileName(), member);
+                    List<String> ids = idsOf.computeIfAbsent(member.fileName(), key -> new ArrayList<>());
+                    if (!ids.contains(entry.getKey())) {
+                        ids.add(entry.getKey());
+                    }
+                    List<String> others = othersOf.computeIfAbsent(member.fileName(), key -> new ArrayList<>());
+                    String text = other.fileName() + " [NeoForge " + versionText(other) + ", id=" + idText(other)
+                            + "] at " + other.path();
+                    if (!others.contains(text)) {
+                        others.add(text);
+                    }
+                }
+            }
+        }
+        for (Map.Entry<String, ModJarInfo> entry : conflicted.entrySet()) {
+            ModJarInfo member = entry.getValue();
+            List<String> ids = idsOf.get(member.fileName());
+            List<String> others = othersOf.get(member.fileName());
+            ForbricLog.warn("  duplicate modid %s on two different NeoForge files: %s [NeoForge %s, id=%s] at %s",
+                    String.join("/", ids), member.fileName(), versionText(member), idText(member), member.path());
+            ForbricLog.warn("    the other file is %s", String.join("; ", others));
+            notes.add("two NeoForge files provide " + String.join("/", ids) + ": " + member.fileName() + " and "
+                    + String.join(", ", others) + " (both kept)");
+            report(member.fileName(), "native-version-conflict", "another NeoForge file provides "
+                    + String.join("/", ids) + ": " + String.join("; ", others)
+                    + "; both files were kept, choose one by hand", false);
+        }
+        for (Map.Entry<String, List<String>> entry : unknownOf.entrySet()) {
+            List<String> ids = entry.getValue();
+            ForbricLog.warn("  cannot read %s, so it is not known whether it differs from the other NeoForge "
+                    + "file that provides %s", entry.getKey(), String.join("/", ids));
+            report(entry.getKey(), "native-version-unknown", "the file could not be read, so it is not known whether "
+                    + "it differs from the other NeoForge file that provides " + String.join("/", ids)
+                    + "; both files were kept", false);
+        }
+        return conflicted.size();
+    }
+
+    private static String versionText(ModJarInfo jar) {
+        return jar.version() == null || jar.version().isBlank() ? "unknown version" : jar.version();
+    }
+
+
+    private static String idText(ModJarInfo jar) {
+        return jar.allModIds().isEmpty() ? "no modid" : String.join("/", jar.allModIds());
+    }
+
+
+    private static ModJarInfo jarNamed(List<ModJarInfo> jars, String fileName) {
+        for (ModJarInfo jar : jars) {
+            if (jar.fileName().equals(fileName)) {
+                return jar;
+            }
+        }
+        return null;
+    }
+
+
+    private static boolean containsFile(List<ModJarInfo> jars, String fileName) {
+        for (ModJarInfo jar : jars) {
+            if (jar.fileName().equals(fileName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
+    private void resolveDuplicates(Map<String, DuplicateJars.Conflict> duplicates,
+            Map<String, OriginalSnapshot> snapshots) {
         for (Map.Entry<String, DuplicateJars.Conflict> entry : duplicates.entrySet()) {
             DuplicateJars.Conflict conflict = entry.getValue();
             ModJarInfo winner = conflict.winner();
@@ -465,12 +1208,20 @@ public final class TranspileEngine {
                 notes.add("duplicate removed with an uncovered modid: " + loserName + " also provided "
                         + String.join("/", conflict.uncoveredModIds()));
             }
+            OriginalSnapshot snapshot = snapshots.get(loserName);
+            String problem = originalProblem(loser, snapshot);
+            if (problem != null) {
+                ForbricLog.warn("  duplicate kept: %s (%s)", loserName, problem);
+                notes.add("duplicate kept: " + loserName + " (" + problem + ")");
+                report(loserName, "unresolved-duplicate", "kept: " + problem, false);
+                continue;
+            }
             Path backup = workDir.resolve("backup").resolve(loserName);
             InstallJournal.Entry transaction;
             try {
                 Files.createDirectories(backup.getParent());
                 transaction = journal.open(InstallJournal.Kind.REMOVE, loser, null, null, backup, null,
-                        Hashes.sha1(loser), "");
+                        snapshot.sha1(), "");
             } catch (IOException e) {
                 ForbricLog.error("  cannot remove duplicate " + loserName, e);
                 notes.add("duplicate removal failed: " + loserName + " (" + e + ")");
@@ -522,7 +1273,48 @@ public final class TranspileEngine {
     private record DepTask(Path jar, int depth) {}
 
 
-    private record DepInstall(Path jar, boolean installed) {}
+    private record DepInstall(Path jar, boolean installed, String version, String refusal) {}
+
+
+    private record DependencyConstraint(String modId, DependencyRequirement requirement, String requiredBy) {
+
+        String describe(String version) {
+            return requiredBy + " requires " + requirement.versionRange() + " (side " + requirement.side()
+                    + ") but the candidate version is "
+                    + (version == null || version.isBlank() ? "unknown" : version);
+        }
+
+
+        String outcome(VersionRange.Verdict verdict, String version) {
+            String state = switch (verdict) {
+                case SATISFIED -> "satisfied";
+                case NOT_SATISFIED -> "not satisfied";
+                case UNKNOWN -> "unverified";
+            };
+            return requiredBy + " needs " + requirement.versionRange() + " -> " + state
+                    + " (candidate " + (version == null || version.isBlank() ? "unknown" : version) + ")";
+        }
+    }
+
+
+    private record DependencyVerdict(Boolean satisfied, String detail, List<String> outcomes) {
+
+        static DependencyVerdict of(VersionRange.Verdict verdict, DependencyConstraint constraint, String version) {
+            return new DependencyVerdict(verdict == VersionRange.Verdict.SATISFIED ? Boolean.TRUE : null,
+                    constraint.describe(version), List.of(constraint.outcome(verdict, version)));
+        }
+
+        String label() {
+            if (Boolean.TRUE.equals(satisfied)) {
+                return "version range verified";
+            }
+            return satisfied == null ? "version range unverified" : "version range not satisfied";
+        }
+
+        String summary() {
+            return outcomes.isEmpty() ? "" : " (" + label() + ": " + String.join("; ", outcomes) + ")";
+        }
+    }
 
 
     private void installMissingDependencies() {
@@ -537,26 +1329,68 @@ public final class TranspileEngine {
         }
         Deque<DepTask> queue = new ArrayDeque<>();
         Set<Path> seen = new LinkedHashSet<>();
-        for (Path jar : installedThisRound) {
+        List<Path> installedOrder = new ArrayList<>(installedThisRound);
+        installedOrder.sort(java.util.Comparator.comparing(path -> path.getFileName().toString()));
+        for (Path jar : installedOrder) {
             if (seen.add(jar)) {
                 queue.add(new DepTask(jar, 0));
             }
         }
         Set<String> attempted = new HashSet<>();
-        ProgressStage stage = beginStage("dependencies", "NeoForbric: Installing dependencies", queue.size());
+        Map<String, List<DependencyConstraint>> constraints = new HashMap<>();
+        Map<String, String> resolvedVersions = new HashMap<>();
+        Map<String, String> refusalReasons = new HashMap<>();
+        ProgressStage stage = beginStage("dependencies", "Installing dependencies", queue.size());
         while (!queue.isEmpty()) {
-            DepTask task = queue.poll();
+            List<DepTask> wave = new ArrayList<>();
+            while (!queue.isEmpty()) {
+                wave.add(queue.poll());
+            }
+            for (DepTask task : wave) {
+                String parent = task.jar().getFileName().toString();
+                if (task.depth() >= dependencyDepth || !Files.isRegularFile(task.jar())) {
+                    continue;
+                }
+                for (DependencyRequirement requirement : ModDependencies.required(task.jar())) {
+                    String key = requirement.modId().toLowerCase(Locale.ROOT);
+                    List<DependencyConstraint> known = constraints.get(key);
+                    if (known == null) {
+                        known = new ArrayList<>();
+                        constraints.put(key, known);
+                    }
+                    DependencyConstraint constraint = new DependencyConstraint(requirement.modId(), requirement,
+                            parent);
+                    if (!known.contains(constraint)) {
+                        known.add(constraint);
+                    }
+                }
+            }
+            for (DepTask task : wave) {
             String requiredBy = task.jar().getFileName().toString();
             if (task.depth() < dependencyDepth && Files.isRegularFile(task.jar())) {
                 for (DependencyRequirement requirement : ModDependencies.required(task.jar())) {
                     String depId = requirement.modId();
                     String key = depId.toLowerCase(Locale.ROOT);
-                    if (!attempted.add(key)) {
-                        continue;
+                    List<DependencyConstraint> known = constraints.get(key);
+                    if (known == null) {
+                        known = new ArrayList<>();
+                        constraints.put(key, known);
                     }
                     ModJarInfo already = present.get(key);
                     if (already != null) {
-                        checkDependencyVersion(already, requirement, requiredBy);
+                        checkDependencyVersion(already.fileName(), already.version(), requirement, requiredBy);
+                        continue;
+                    }
+                    String refused = refusalReasons.get(key);
+                    if (refused != null) {
+                        reportRefusedConstraint(requirement, requiredBy, resolvedVersions.get(key), refused);
+                        continue;
+                    }
+                    if (!attempted.add(key)) {
+                        String knownVersion = resolvedVersions.get(key);
+                        if (knownVersion != null) {
+                            checkDependencyVersion(depId, knownVersion, requirement, requiredBy);
+                        }
                         continue;
                     }
                     if (blacklist.contains(depId)) {
@@ -582,28 +1416,40 @@ public final class TranspileEngine {
                                 false);
                         continue;
                     }
-                    DepInstall installed = installDependency(depId, target.value(), requiredBy);
-                    if (installed != null) {
-                        if (installed.installed()) {
-                            dependenciesInstalled++;
-                        }
-                        try {
-                            present.put(key, ModJarScanner.inspect(installed.jar()));
-                        } catch (IOException e) {
-                            ForbricLog.warn("  cannot re-read the new dependency %s: %s", depId, e.toString());
-                        }
-                        queue.add(new DepTask(installed.jar(), task.depth() + 1));
-                        stage.expectMore(1);
+                    DepInstall installed = installDependency(depId, target.value(), requiredBy, known);
+                    if (installed == null) {
+                        continue;
                     }
+                    if (installed.version() != null) {
+                        resolvedVersions.put(key, installed.version());
+                    }
+                    if (installed.refusal() != null) {
+                        refusalReasons.put(key, installed.refusal());
+                    }
+                    if (installed.installed()) {
+                        dependenciesInstalled++;
+                    }
+                    if (installed.jar() == null) {
+                        continue;
+                    }
+                    try {
+                        present.put(key, ModJarScanner.inspect(installed.jar()));
+                    } catch (IOException e) {
+                        ForbricLog.warn("  cannot re-read the new dependency %s: %s", depId, e.toString());
+                    }
+                    queue.add(new DepTask(installed.jar(), task.depth() + 1));
+                    stage.expectMore(1);
                 }
             }
             stage.done(task.jar().toString() + ":" + task.depth(), screen("Dependencies checked for " + requiredBy));
+            }
         }
         endStage(stage);
     }
 
 
-    private DepInstall installDependency(String modId, TranspileTarget target, String requiredBy) {
+    private DepInstall installDependency(String modId, TranspileTarget target, String requiredBy,
+            List<DependencyConstraint> constraints) {
         Path staging = workDir.resolve("downloads").resolve("dep-" + modId + ".jar.new");
         try {
             Files.createDirectories(staging.getParent());
@@ -619,8 +1465,11 @@ public final class TranspileEngine {
             return null;
         }
         String expected = expectedDependencyModId(modId);
+        String candidateVersion = null;
+        DependencyVerdict verdict = null;
         try {
             ModJarInfo check = ModJarScanner.inspect(staging);
+            candidateVersion = check.version();
             if (check.kind() != ModKind.NEOFORGE) {
 
 
@@ -637,6 +1486,23 @@ public final class TranspileEngine {
                 notes.add("dependency modid mismatch: wanted " + expected + ", got "
                         + (check.allModIds().isEmpty() ? "none" : String.join("/", check.allModIds())));
                 return null;
+            }
+            verdict = checkConstraints(constraints, candidateVersion);
+            if (Boolean.FALSE.equals(verdict.satisfied())) {
+                ForbricLog.warn("  dependency %s: %s -> not installing it (%s)", modId, verdict.detail(),
+                        String.join("; ", verdict.outcomes()));
+                Files.deleteIfExists(staging);
+                notes.add("dependency version rejected: " + modId + " (" + verdict.detail() + "; "
+                        + String.join("; ", verdict.outcomes()) + ")");
+                report(target.fileName(), "dependency-version-mismatch",
+                        verdict.detail() + verdict.summary(), false);
+                return new DepInstall(null, false, candidateVersion, verdict.detail());
+            }
+            if (verdict.satisfied() == null) {
+                ForbricLog.warn("  dependency %s: %s -> installing it unverified (%s)", modId, verdict.detail(),
+                        String.join("; ", verdict.outcomes()));
+                notes.add("dependency version unverified: " + modId + " (" + verdict.detail() + "; "
+                        + String.join("; ", verdict.outcomes()) + ")");
             }
         } catch (IOException e) {
             ForbricLog.error("  dependency verify failed: " + modId, e);
@@ -660,32 +1526,91 @@ public final class TranspileEngine {
         if (outcome.reused()) {
             ForbricLog.info("  dependency %s already present as %s with the same content, kept it", modId,
                     dest.getFileName());
-            return new DepInstall(dest, false);
+            return new DepInstall(dest, false, candidateVersion, null);
         }
         if (ServiceEntries.entersServiceLayer(dest)) {
             serviceLayerChanged++;
         }
-        ForbricLog.info("  installed dependency %s: %s (%s)", modId, target.fileName(), target.versionNumber());
-        report(target.fileName(), "dependency", modId + " required by " + requiredBy, false);
+        ForbricLog.info("  installed dependency %s: %s (%s, %s)", modId, target.fileName(),
+                target.versionNumber(), verdict == null ? "version range not checked" : verdict.label());
+        report(target.fileName(), "dependency", modId + " required by " + requiredBy
+                + (verdict == null ? "" : constraintSummary(verdict)), false);
         RunStats.dependency(modId, target.versionNumber(), target.project().source(), requiredBy);
-        return new DepInstall(dest, true);
+        return new DepInstall(dest, true, candidateVersion, null);
     }
 
 
-    private void checkDependencyVersion(ModJarInfo installed, DependencyRequirement requirement, String requiredBy) {
+    private void checkDependencyVersion(String fileName, String version, DependencyRequirement requirement,
+            String requiredBy) {
         if (!requirement.hasVersionRange()) {
             return;
         }
-        VersionRange.Verdict verdict = VersionRange.check(installed.version(), requirement.versionRange());
-        if (verdict != VersionRange.Verdict.NOT_SATISFIED) {
+        VersionRange.Verdict verdict = VersionRange.check(version, requirement.versionRange());
+        if (verdict == VersionRange.Verdict.SATISFIED) {
+            ForbricLog.debug("  dependency %s %s satisfies %s required by %s", requirement.modId(),
+                    orUnknown(version), requirement.versionRange(), requiredBy);
+            return;
+        }
+        if (verdict == VersionRange.Verdict.UNKNOWN) {
+            ForbricLog.debug("  cannot compare dependency %s %s with %s required by %s", requirement.modId(),
+                    orUnknown(version), requirement.versionRange(), requiredBy);
             return;
         }
         ForbricLog.warn("  dependency %s is installed as %s but %s requires %s, not replacing it automatically",
-                requirement.modId(), orUnknown(installed.version()), requiredBy, requirement.versionRange());
-        notes.add("dependency version mismatch: " + requirement.modId() + " is " + orUnknown(installed.version())
+                requirement.modId(), orUnknown(version), requiredBy, requirement.versionRange());
+        notes.add("dependency version mismatch: " + requirement.modId() + " is " + orUnknown(version)
                 + ", " + requiredBy + " requires " + requirement.versionRange() + " (left as it is)");
-        report(installed.fileName(), "dependency-version-mismatch",
+        report(fileName, "dependency-version-mismatch",
                 requirement.versionRange() + " required by " + requiredBy, false);
+    }
+
+
+    private void reportRefusedConstraint(DependencyRequirement requirement, String requiredBy, String version,
+            String refusal) {
+        if (!requirement.hasVersionRange()) {
+            return;
+        }
+        ForbricLog.warn("  dependency %s was not installed for %s: %s", requirement.modId(), requiredBy, refusal);
+        notes.add("dependency version mismatch: " + requirement.modId() + " is " + orUnknown(version)
+                + ", " + requiredBy + " requires " + requirement.versionRange() + " (not installed: " + refusal
+                + ")");
+        report(requirement.modId(), "dependency-version-mismatch",
+                requirement.versionRange() + " required by " + requiredBy + ", candidate " + orUnknown(version)
+                        + " was refused", false);
+    }
+
+
+    private static String constraintSummary(DependencyVerdict verdict) {
+        return verdict.summary();
+    }
+
+
+    private static DependencyVerdict checkConstraints(List<DependencyConstraint> constraints, String version) {
+        String unsatisfied = null;
+        String unknown = null;
+        List<String> outcomes = new ArrayList<>();
+        for (DependencyConstraint constraint : constraints) {
+            if (!constraint.requirement().hasVersionRange()) {
+                continue;
+            }
+            VersionRange.Verdict verdict = VersionRange.check(version,
+                    constraint.requirement().versionRange());
+            outcomes.add(constraint.outcome(verdict, version));
+            if (verdict == VersionRange.Verdict.NOT_SATISFIED) {
+                if (unsatisfied == null) {
+                    unsatisfied = constraint.describe(version);
+                }
+            } else if (verdict == VersionRange.Verdict.UNKNOWN && unknown == null) {
+                unknown = constraint.describe(version);
+            }
+        }
+        if (unsatisfied != null) {
+            return new DependencyVerdict(Boolean.FALSE, unsatisfied, List.copyOf(outcomes));
+        }
+        if (unknown != null) {
+            return new DependencyVerdict(null, unknown, List.copyOf(outcomes));
+        }
+        return new DependencyVerdict(Boolean.TRUE, "", List.copyOf(outcomes));
     }
 
 
@@ -721,9 +1646,9 @@ public final class TranspileEngine {
 
     private Result abortRound(String what) {
         return abortRound("aborted: unreadable " + what + " file",
-                "NeoForbric could not read its " + what + " file, so no mod was touched this round. "
+                ForbricLog.TAG + " could not read its " + what + " file, so no mod was touched this round. "
                         + "Fix or delete that file and start the game again.",
-                "NeoForbric could not read its " + what + " file; no mod was touched.");
+                ForbricLog.TAG + " could not read its " + what + " file; no mod was touched.");
     }
 
 
@@ -742,23 +1667,25 @@ public final class TranspileEngine {
 
     private String decisionEnv() {
         StringBuilder sb = new StringBuilder();
-        sb.append("decisions-v3\n");
+        sb.append("decisions-v5\n");
         sb.append("gameVersion=").append(gameVersion).append('\n');
         sb.append("enable=").append(config.getBool("enable", true)).append('\n');
         sb.append("forge.enable=").append(config.getBool("forge.enable", true)).append('\n');
         sb.append("fabric.enable=").append(config.getBool("fabric.enable", true)).append('\n');
         sb.append("mirror.enable=").append(config.getBool("mirror.enable", true)).append('\n');
-        sb.append("source.curseforge.enable=").append(config.getBool("source.curseforge.enable", true)).append('\n');
-        sb.append("source.curseforge.api=").append(config.get("source.curseforge.api", CURSEFORGE_MIRROR)).append('\n');
-        sb.append("source.curseforge.apiKey=").append(secretState(config.get("source.curseforge.apiKey", "")))
+        sb.append("mirror.thirdparty.modrinth.enable=")
+                .append(config.getBool("mirror.thirdparty.modrinth.enable", false)).append('\n');
+        sb.append("mirror.thirdparty.github.enable=")
+                .append(config.getBool("mirror.thirdparty.github.enable", false)).append('\n');
+        sb.append("source.modrinth.mirror.enable=").append(config.getBool("source.modrinth.mirror.enable", false))
                 .append('\n');
-        sb.append("source.modrinth.mirror.enable=").append(config.getBool("source.modrinth.mirror.enable", true))
-                .append('\n');
-        sb.append("source.modrinth.mirror.api=").append(config.get("source.modrinth.mirror.api", MODRINTH_MIRROR))
+        sb.append("source.modrinth.mirror.api=").append(Mirrors.identityOf(config.get("source.modrinth.mirror.api",
+                MODRINTH_MIRROR)))
                 .append('\n');
         sb.append("source.modrinth.official.enable=").append(config.getBool("source.modrinth.official.enable", true))
                 .append('\n');
-        sb.append("source.modrinth.official.api=").append(config.get("source.modrinth.official.api", MODRINTH_OFFICIAL))
+        sb.append("source.modrinth.official.api=")
+                .append(Mirrors.identityOf(config.get("source.modrinth.official.api", MODRINTH_OFFICIAL)))
                 .append('\n');
         sb.append("fabric.connector.projects=")
                 .append(config.get("fabric.connector.projects", "connector,sinytra-connector")).append('\n');
@@ -783,14 +1710,6 @@ public final class TranspileEngine {
     }
 
 
-    private static String secretState(String secret) {
-        if (secret == null || secret.isBlank()) {
-            return "absent";
-        }
-        return "set:" + Hashes.sha256(secret.trim()).substring(0, 12);
-    }
-
-
     private long negativeTtlMillis() {
         return Math.max(1, config.getInt("cache.notFoundDays", 7)) * 86_400_000L;
     }
@@ -807,6 +1726,19 @@ public final class TranspileEngine {
         }
         if (!portMap.isEmpty()) {
             ForbricLog.debug("port map: %d entries (%s)", portMap.size(), portMap.origin());
+            List<PortMap.Unsupported> unsupported = portMap.unsupportedTargets();
+            if (!unsupported.isEmpty()) {
+                List<String> listed = new ArrayList<>();
+                for (PortMap.Unsupported entry : unsupported) {
+                    listed.add(entry.modId() + " -> " + entry.project());
+                }
+                ForbricLog.warn("port map targets that name a source this build removed, they are skipped and no"
+                        + " request is sent for them: %s. CurseForge access was removed in 0.0.10 and a numeric"
+                        + " CurseForge project id is never read as a Modrinth id. Replace them with Modrinth"
+                        + " project ids or slugs, or delete those targets. Your ports.properties was not"
+                        + " changed.", listed);
+                notes.add("port map has " + unsupported.size() + " target(s) that name a removed source");
+            }
         } else if (portMap.unreadable()) {
             ForbricLog.warn("port map unreadable, the built-in table is used");
             notes.add("port map unreadable, the built-in table was used");
@@ -824,9 +1756,9 @@ public final class TranspileEngine {
                 ForbricLog.error("  %s", problem);
             }
             return abortRound("aborted: an unfinished file replacement could not be recovered",
-                    "NeoForbric found an unfinished file replacement in mods/ and could not put it back safely, "
+                    ForbricLog.TAG + " found an unfinished file replacement in mods/ and could not put it back safely, "
                             + "so no mod was touched this round. " + String.join(" | ", recovery.problems()),
-                    "NeoForbric could not recover an unfinished file replacement; no mod was touched.");
+                    ForbricLog.TAG + " could not recover an unfinished file replacement; no mod was touched.");
         }
         cleanDownloadCache();
         long scanStart = System.nanoTime();
@@ -900,6 +1832,7 @@ public final class TranspileEngine {
 
         DuplicateJars.Plan dupPlan = DuplicateJars.plan(jars, TranspileEngine::sha1Of);
         Map<String, DuplicateJars.Conflict> duplicates = new LinkedHashMap<>();
+        Map<String, OriginalSnapshot> loserSnapshots = new LinkedHashMap<>();
         if (removeRedundant) {
             for (Map.Entry<String, DuplicateJars.Conflict> entry : dupPlan.losers().entrySet()) {
                 if (blacklistedFiles.contains(entry.getKey())
@@ -911,6 +1844,8 @@ public final class TranspileEngine {
                     continue;
                 }
                 duplicates.put(entry.getKey(), entry.getValue());
+                ModJarInfo loserJar = jarNamed(jars, entry.getKey());
+                loserSnapshots.put(entry.getKey(), loserJar == null ? null : snapshotOf(loserJar));
             }
         }
         List<ModJarInfo> skippedJars = new ArrayList<>();
@@ -920,13 +1855,8 @@ public final class TranspileEngine {
                 continue;
             }
             skippedJars.add(jar);
-            ForbricLog.info("  keep %s: modid %s is already provided by a native NeoForge mod",
-                    jar.fileName(), String.join("/", jar.allModIds()));
-            report(jar, "kept-native-neoforge", "a native NeoForge build with the same modid is installed", false);
-        }
-        if (!skippedJars.isEmpty()) {
-            ForbricLog.game("Kept %d mod(s) as-is: a native NeoForge build with the same modid is installed",
-                    skippedJars.size());
+            ForbricLog.info("  keep %s: modid %s is also provided by a native NeoForge file; the duplicate "
+                    + "check runs after the replacements", jar.fileName(), String.join("/", jar.allModIds()));
         }
         Set<String> excluded = new LinkedHashSet<>(skippedJars.stream().map(ModJarInfo::fileName).toList());
         excluded.addAll(blacklistedFiles);
@@ -973,10 +1903,12 @@ public final class TranspileEngine {
         }
 
 
-        resolveDuplicates(duplicates);
+        resolveDuplicates(duplicates, loserSnapshots);
+        DuplicateReview duplicateReview = resolveNativeOverlaps(blacklistedFiles, duplicates,
+                dupPlan.nativeOverlaps().keySet());
 
 
-        List<ModJarInfo> inventory = ModJarScanner.scan(modsDir);
+        List<ModJarInfo> inventory = duplicateReview.inventory();
         int fabricKept = 0;
         List<ModJarInfo> connectorDependents = new ArrayList<>();
         for (ModJarInfo jar : inventory) {
@@ -1001,7 +1933,7 @@ public final class TranspileEngine {
         boolean[] fabricResult = new boolean[] {false, false, false, false, false, false};
         boolean wantFabricSupport = fabricKept > 0 || !connectorDependents.isEmpty();
         if (wantFabricSupport && config.getBool("fabric.enable", true)) {
-            fabricResult = ensureFabricSupport(inventory);
+            fabricResult = ensureFabricSupport(inventory, fabricKept > 0);
         } else if (!fabricJars.isEmpty() && fabricKept == 0) {
             ForbricLog.info("no connector needed: all fabric mods replaced");
         } else if (config.getBool("fabric.enable", true)) {
@@ -1055,6 +1987,15 @@ public final class TranspileEngine {
         } else {
             ForbricLog.game("Nothing to translate");
         }
+        if (duplicateReview.removedRedundant() > 0) {
+            ForbricLog.game("Moved %d redundant duplicate mod file(s) to the backup folder",
+                    duplicateReview.removedRedundant());
+        }
+        int duplicateFilesToReview = duplicateReview.keptDuplicates().size() + duplicateReview.nativeConflicts();
+        if (duplicateFilesToReview > 0) {
+            ForbricLog.gameWarn("%d duplicate mod file(s) need your review: another file provides the same modid; "
+                    + "nothing was removed for them, the log lists the full paths", duplicateFilesToReview);
+        }
         if (dependenciesInstalled > 0) {
             ForbricLog.game("Installed %d missing dependency mod(s)", dependenciesInstalled);
         }
@@ -1091,8 +2032,9 @@ public final class TranspileEngine {
 
 
     private int[] transpileFabric(List<ModJarInfo> fabricJars, TranspileState state, List<ModJarInfo> remaining) {
-        ProgressStage stage = beginStage("fabric", "NeoForbric: Translating Fabric mods", fabricJars.size());
-        List<Pending> pending = new ArrayList<>();
+        ProgressStage stage = beginStage("fabric", "Translating Fabric", fabricJars.size());
+        ExecutorCompletionService<Object> completions = new ExecutorCompletionService<>(pool);
+        Map<Future<Object>, Pending> pending = new LinkedHashMap<>();
         for (ModJarInfo jar : fabricJars) {
             String sha1 = sha1Of(jar);
             TranspileState.Decision known = state.decisionOf(sha1);
@@ -1117,7 +2059,8 @@ public final class TranspileEngine {
                             jar.fileName(), known.describe());
                 }
             }
-            pending.add(new Pending(jar, sha1, pool.submit(() -> prepare(jar, Mode.FABRIC, sha1))));
+            Future<Object> future = completions.submit(() -> prepare(jar, Mode.FABRIC, sha1));
+            pending.put(future, new Pending(jar, sha1, future));
         }
         if (!pending.isEmpty()) {
 
@@ -1125,18 +2068,18 @@ public final class TranspileEngine {
         }
 
         int replaced = 0;
-        for (Pending item : pending) {
+        while (!pending.isEmpty()) {
+            Pending item = nextCompleted(completions, pending);
             ModJarInfo jar = item.jar();
             String sha1 = item.sha1();
             Object outcome = await(item.future());
             if (outcome instanceof Prepared prepared) {
-                if (apply(prepared) != null) {
+                InstallResult installedResult = apply(prepared);
+                if (installedResult != null) {
                     replaced++;
                     state.remember(prepared.originalSha1(), TranspileState.REPLACED_FABRIC,
                             prepared.target().versionNumber());
-                    report(jar, "replaced",
-                            prepared.target().versionNumber() + " via " + prepared.target().howFound().label(),
-                            prepared.target().sameVersion());
+                    reportReplaced(jar, prepared, installedResult, prepared.target().sameVersion());
                     stage.done(jar.fileName(), screen("Translated " + jar.fileName()));
                 } else {
                     remaining.add(jar);
@@ -1178,8 +2121,9 @@ public final class TranspileEngine {
 
 
     private int[] transpileForge(List<ModJarInfo> forgeJars, TranspileState state) {
-        ProgressStage stage = beginStage("forge", "NeoForbric: Translating Forge mods", forgeJars.size());
-        List<Pending> pending = new ArrayList<>();
+        ProgressStage stage = beginStage("forge", "Translating Forge", forgeJars.size());
+        ExecutorCompletionService<Object> completions = new ExecutorCompletionService<>(pool);
+        Map<Future<Object>, Pending> pending = new LinkedHashMap<>();
         int replaced = 0;
         int sameVersion = 0;
         int failed = 0;
@@ -1216,28 +2160,29 @@ public final class TranspileEngine {
                             known.describe());
                 }
             }
-            pending.add(new Pending(jar, sha1, pool.submit(() -> prepare(jar, Mode.FORGE, sha1))));
+            Future<Object> future = completions.submit(() -> prepare(jar, Mode.FORGE, sha1));
+            pending.put(future, new Pending(jar, sha1, future));
         }
         if (!pending.isEmpty()) {
 
             stall();
         }
 
-        for (Pending item : pending) {
+        while (!pending.isEmpty()) {
+            Pending item = nextCompleted(completions, pending);
             ModJarInfo jar = item.jar();
             String sha1 = item.sha1();
             Object outcome = await(item.future());
             if (outcome instanceof Prepared prepared) {
-                if (apply(prepared) != null) {
+                InstallResult installedResult = apply(prepared);
+                if (installedResult != null) {
                     replaced++;
                     if (prepared.target().sameVersion()) {
                         sameVersion++;
                     }
                     state.remember(prepared.originalSha1(), TranspileState.REPLACED_FORGE,
                             prepared.target().versionNumber());
-                    report(jar, "replaced",
-                            prepared.target().versionNumber() + " via " + prepared.target().howFound().label(),
-                            prepared.target().sameVersion());
+                    reportReplaced(jar, prepared, installedResult, prepared.target().sameVersion());
                     stage.done(jar.fileName(), screen("Translated " + jar.fileName()));
                 } else {
                     failed++;
@@ -1269,9 +2214,9 @@ public final class TranspileEngine {
 
 
     private String forgeFailureMessage(ModJarInfo jar, String reason) {
-        return "NeoForbric could not find a NeoForge build for " + jar.fileName()
+        return ForbricLog.TAG + " could not find a NeoForge build for " + jar.fileName()
                 + " (modid=" + safe(jar.modId()) + ", version=" + safe(jar.version())
-                + ") on CurseForge or Modrinth for Minecraft " + gameVersion + ". Reason: " + reason
+                + ") on the official Modrinth API for Minecraft " + gameVersion + ". Reason: " + reason
                 + ". The original Forge jar was left untouched. See logs/neoforbric.log for the full trace.";
     }
 
@@ -1301,8 +2246,22 @@ public final class TranspileEngine {
                     if (viaPort.uncertain()) {
                         uncertain = viaPort;
                     }
-                    ForbricLog.warn("  port map: %s -> %s has no %s NeoForge build, falling back",
-                            jar.modId(), port.targets().get(0).project(), gameVersion);
+                    List<PortMap.Unsupported> dropped = new ArrayList<>();
+                    for (PortMap.Target target : port.targets()) {
+                        if (!target.source().supported()) {
+                            dropped.add(new PortMap.Unsupported(jar.modId(), target.project()));
+                        }
+                    }
+                    if (dropped.size() == port.targets().size()) {
+                        ForbricLog.warn("  port map: %s -> %s names a source this build removed, no request was"
+                                + " sent; falling back to the normal search. Replace the CurseForge id in"
+                                + " ports.properties with a Modrinth id or slug (this file is not changed"
+                                + " automatically)", jar.modId(), port.targets().get(0).project());
+                        notes.add("port map " + jar.modId() + " names a removed source, ignored");
+                    } else {
+                        ForbricLog.warn("  port map: %s -> %s has no %s NeoForge build, falling back",
+                                jar.modId(), port.targets().get(0).project(), gameVersion);
+                    }
                 }
             }
 
@@ -1423,6 +2382,27 @@ public final class TranspileEngine {
     }
 
 
+    private static String describeReplacement(Prepared prepared, InstallResult install, ModJarInfo installed,
+            Path backup) {
+        TranspileTarget target = prepared.target();
+        String source = target.fileName() == null || target.fileName().isBlank()
+                ? "an unnamed source file" : target.fileName();
+        return "source " + source + " [" + target.versionNumber() + "] via " + target.howFound().label()
+                + "; installed as " + install.installedPath().getFileName() + " [" + installed.kind().display() + " "
+                + versionText(installed) + ", id=" + idText(installed) + "] at " + install.installedPath()
+                + "; backup " + (backup == null ? "not created" : backup.toString());
+    }
+
+    private static ModJarInfo inspectQuietly(Path jar) {
+        try {
+            return ModJarScanner.inspect(jar);
+        } catch (IOException e) {
+            return new ModJarInfo(jar, jar.getFileName().toString(), ModKind.UNKNOWN, "", "", "",
+                    -1, List.of(), List.of());
+        }
+    }
+
+
     private InstallResult apply(Prepared prepared) {
         ModJarInfo jar = prepared.jar();
         TranspileTarget chosen = prepared.target();
@@ -1434,29 +2414,41 @@ public final class TranspileEngine {
             ForbricLog.debug("  %s: %s", jar.fileName(), step);
         }
         if (!outcome.ok()) {
+            if (outcome.failedStep() == FileInstaller.Step.CONFLICT) {
+                ForbricLog.warn("  %s: another mod in this run already placed a different build at the same "
+                        + "target name; the file placed first is kept", jar.fileName());
+            }
             ForbricLog.error("replace failed: %s at %s (%s)", jar.fileName(), outcome.failedStep(), outcome.detail());
             notes.add("replace failed: " + jar.fileName() + " (" + outcome.detail() + ")");
             report(jar, "failed", outcome.detail(), false);
-            addError(jar, "NeoForbric failed to replace " + jar.fileName() + ": " + outcome.detail());
+            addError(jar, ForbricLog.TAG + " failed to replace " + jar.fileName() + ": " + outcome.detail());
             return null;
         }
         Path installed = outcome.installedPath();
+        ModJarInfo installedInfo = inspectQuietly(installed);
         if (outcome.reused()) {
-            ForbricLog.info("  %s already present at %s with the same content, reused it", jar.fileName(),
-                    installed.getFileName());
+            ForbricLog.info("  reused the build already in mods/ for %s: %s [%s %s, id=%s] at %s",
+                    jar.fileName(), installed.getFileName(), installedInfo.kind().display(),
+                    versionText(installedInfo), idText(installedInfo), installed);
         } else if (!installed.equals(jar.path())) {
             ForbricLog.info("  renamed: %s -> %s (forge.keepFileName=false)", jar.fileName(),
                     installed.getFileName());
         }
         if (outcome.rollbackLeftover() != null) {
-            ForbricLog.warn("  the temporary rollback file is still on disk: %s", outcome.rollbackLeftover());
-            notes.add("rollback file left behind: " + outcome.rollbackLeftover());
+            ForbricLog.warn("  a temporary file is still on disk: %s (it is not an active mod file)",
+                    outcome.rollbackLeftover());
+            notes.add("temporary file left behind: " + outcome.rollbackLeftover());
         }
-        if (!backup) {
-            ForbricLog.info("  no long-term backup kept (forge.backup=false)");
-        }
-        ForbricLog.info("  replaced %s -> %s (from %s, %s)", jar.fileName(), chosen.versionNumber(),
-                chosen.project().source(), Timing.seconds(prepared.elapsedSeconds()));
+        ForbricLog.info("  replaced %s [%s %s, id=%s] at %s", jar.fileName(), jar.kind().display(),
+                versionText(jar), idText(jar), jar.path());
+        ForbricLog.info("    source returned %s [%s] from %s",
+                chosen.fileName() == null || chosen.fileName().isBlank() ? "an unnamed file" : chosen.fileName(),
+                chosen.versionNumber(), chosen.project().source());
+        ForbricLog.info("    installed as %s [%s %s, id=%s] at %s", installed.getFileName(),
+                installedInfo.kind().display(), versionText(installedInfo), idText(installedInfo), installed);
+        ForbricLog.info("    backup %s; elapsed %s", outcome.backupPath() == null
+                ? (backup ? "not created" : "none (forge.backup=false)") : outcome.backupPath().toString(),
+                Timing.seconds(prepared.elapsedSeconds()));
 
         if (prepared.serviceLayerChanged()) {
 
@@ -1473,15 +2465,17 @@ public final class TranspileEngine {
     }
 
 
-    private boolean[] ensureFabricSupport(List<ModJarInfo> inventory) {
+    private boolean[] ensureFabricSupport(List<ModJarInfo> inventory, boolean fabricModsPresent) {
         String connectorProject = config.get("fabric.connector.projects", "connector,sinytra-connector");
         String fabricApiProject = config.get("fabric.api.projects", "forgified-fabric-api");
 
-        ProgressStage stage = beginStage("fabric-support", "NeoForbric: Translating Fabric support", 2);
+        ProgressStage stage = beginStage("fabric-support", "Preparing Fabric support", 2);
 
 
+        boolean connectorInPlace = false;
         boolean connectorReady = false;
         boolean connectorDownloaded = false;
+        boolean connectorUnanswered = false;
 
 
         boolean connectorEnabled = false;
@@ -1489,6 +2483,7 @@ public final class TranspileEngine {
         QueryResult<TranspileTarget> connectorTarget = QueryResult.notFound("not resolved yet");
         Path installed = ConnectorJar.findEnabled(modsDir, true).orElse(null);
         if (installed != null) {
+            connectorInPlace = true;
             connectorReady = true;
             connectorJar = installed;
             connectorVersion = ConnectorJar.versionOf(installed).orElse(null);
@@ -1496,6 +2491,7 @@ public final class TranspileEngine {
             progress.message("Sinytra Connector already in place");
         } else if (tryEnableDisabledConnector(installed)) {
 
+            connectorInPlace = true;
             connectorReady = true;
             connectorEnabled = true;
             installed = connectorJar;
@@ -1504,10 +2500,18 @@ public final class TranspileEngine {
         } else {
             connectorTarget = latestInChain(connectorProject);
             if (!connectorTarget.hasValue()) {
+                connectorUnanswered = connectorTarget.uncertain();
                 ForbricLog.error("no NeoForge build for connector (%s): %s", connectorProject,
                         connectorTarget.describe());
-                addError(null, "NeoForbric could not fetch Sinytra Connector from CurseForge or Modrinth. "
-                        + "Fabric mods cannot be loaded without it.");
+                addError(null, connectorUnanswered
+                        ? ForbricLog.TAG + " needs Sinytra Connector but the official Modrinth API could not be queried"
+                                + " successfully for " + connectorProject + ". CurseForge access was removed in"
+                                + " 0.0.10 and no address is guessed. This is not a statement that the component is"
+                                + " missing: try again, and check logs/neoforbric.log."
+                        : ForbricLog.TAG + " needs Sinytra Connector but no matching build could be fetched from the"
+                                + " official Modrinth API for " + connectorProject + ". CurseForge access was removed"
+                                + " in 0.0.10 and no address is guessed. Fabric mods cannot be loaded without it:"
+                                + " download Sinytra Connector yourself, put the jar into mods/ and restart.");
             } else {
                 connectorVersion = connectorTarget.value().versionNumber();
                 ForbricLog.info("  connector target: %s", connectorTarget.value().describe());
@@ -1516,13 +2520,17 @@ public final class TranspileEngine {
 
 
         ModJarInfo installedApi = firstWithModId(inventory, FABRIC_API_MOD_ID);
-        QueryResult<TranspileTarget> fabricApi = QueryResult.notFound("not resolved yet");
         TranspileTarget fabricApiTarget = null;
+        boolean fabricApiInPlace = false;
         boolean fabricApiReady = false;
         boolean fabricApiDownloaded = false;
         boolean fabricApiEnabled = false;
+        boolean fabricApiUnanswered = false;
         String fabricApiVersion = null;
-        if (installedApi != null) {
+        if (!fabricModsPresent) {
+            ForbricLog.info("  ffapi not needed: no Fabric mod is left to load");
+        } else if (installedApi != null) {
+            fabricApiInPlace = true;
             fabricApiReady = true;
             fabricApiVersion = installedApi.version();
             ForbricLog.debug("  ffapi present: %s (%s)",
@@ -1531,6 +2539,7 @@ public final class TranspileEngine {
         } else {
 
 
+            QueryResult<TranspileTarget> fabricApi = QueryResult.notFound("not resolved yet");
             if (connectorVersion != null && !connectorVersion.isBlank()) {
                 QueryResult<TranspileTarget> pinned = pinnedDependency(connectorVersion, fabricApiProject);
                 if (pinned.hasValue()) {
@@ -1545,9 +2554,17 @@ public final class TranspileEngine {
             }
             fabricApiTarget = fabricApi.hasValue() ? fabricApi.value() : null;
             if (fabricApiTarget == null) {
+                fabricApiUnanswered = fabricApi.uncertain();
                 ForbricLog.error("no NeoForge build for ffapi (%s): %s", fabricApiProject, fabricApi.describe());
-                addError(null, "NeoForbric could not fetch Forgified Fabric API from CurseForge or Modrinth. "
-                        + "Fabric mods cannot be loaded without it.");
+                addError(null, fabricApiUnanswered
+                        ? ForbricLog.TAG + " needs Forgified Fabric API but the official Modrinth API could not be queried"
+                                + " successfully for " + fabricApiProject + ". CurseForge access was removed in"
+                                + " 0.0.10 and no address is guessed. This is not a statement that the component is"
+                                + " missing: try again, and check logs/neoforbric.log."
+                        : ForbricLog.TAG + " needs Forgified Fabric API but no matching build could be fetched from the"
+                                + " official Modrinth API for " + fabricApiProject + ". CurseForge access was removed"
+                                + " in 0.0.10 and no address is guessed: download Forgified Fabric API yourself, put"
+                                + " the jar into mods/ and restart.");
             } else {
                 fabricApiVersion = fabricApiTarget.versionNumber();
                 ForbricLog.info("  ffapi target: %s", fabricApiTarget.describe());
@@ -1555,6 +2572,7 @@ public final class TranspileEngine {
                 Path expected = modsDir.resolve(fabricApiTarget.fileName());
                 if (Files.isRegularFile(expected)) {
                     if (providesModId(expected, FABRIC_API_MOD_ID)) {
+                        fabricApiInPlace = true;
                         fabricApiReady = true;
                         ForbricLog.info("  ffapi present");
                         progress.message("Forgified Fabric API already in place");
@@ -1564,11 +2582,12 @@ public final class TranspileEngine {
                                 + "); refusing to overwrite it";
                         ForbricLog.error("  %s", detail);
                         notes.add("fabric api conflict: " + detail);
-                        addError(null, "NeoForbric needs " + FABRIC_API_MOD_ID + " but " + expected.getFileName()
+                        addError(null, ForbricLog.TAG + " needs " + FABRIC_API_MOD_ID + " but " + expected.getFileName()
                                 + " is a different mod. Move or delete that file.");
                     }
                 } else if (tryEnableDisabledFabricApi(fabricApiTarget.versionNumber())) {
 
+                    fabricApiInPlace = true;
                     fabricApiReady = true;
                     fabricApiEnabled = true;
                     progress.message("Forgified Fabric API re-enabled");
@@ -1581,6 +2600,8 @@ public final class TranspileEngine {
 
 
         boolean needFabricApi = fabricApiTarget != null && !fabricApiReady;
+        boolean connectorDispatched = needConnector;
+        boolean fabricApiDispatched = needFabricApi;
         if (needConnector || needFabricApi) {
 
             stall();
@@ -1593,24 +2614,24 @@ public final class TranspileEngine {
             TranspileTarget connectorForDownload = connectorTarget.value();
             TranspileTarget apiTarget = fabricApiTarget;
             Future<DownloadOutcome> connectorFuture = pool.submit(
-                    () -> installComponent(connectorForDownload, "Sinytra Connector", null, true));
+                    () -> installSupport(stage, "connector", connectorForDownload, "Sinytra Connector", null, true));
             Future<DownloadOutcome> fabricApiFuture = pool.submit(
-                    () -> installComponent(apiTarget, "Forgified Fabric API", FABRIC_API_MOD_ID, false));
+                    () -> installSupport(stage, "ffapi", apiTarget, "Forgified Fabric API", FABRIC_API_MOD_ID, false));
             connectorOutcome = awaitOr(connectorFuture, DownloadOutcome.FAILED);
             fabricApiOutcome = awaitOr(fabricApiFuture, DownloadOutcome.FAILED);
         } else if (needConnector) {
             progress.message("Translating Sinytra Connector");
-            connectorOutcome = installComponent(connectorTarget.value(), "Sinytra Connector", null, true);
+            connectorOutcome = installSupport(stage, "connector", connectorTarget.value(), "Sinytra Connector", null, true);
         } else if (needFabricApi) {
             progress.message("Translating Forgified Fabric API");
-            fabricApiOutcome = installComponent(fabricApiTarget, "Forgified Fabric API", FABRIC_API_MOD_ID, false);
+            fabricApiOutcome = installSupport(stage, "ffapi", fabricApiTarget, "Forgified Fabric API", FABRIC_API_MOD_ID, false);
         }
 
         if (needConnector) {
             connectorReady = connectorOutcome.ok();
             connectorDownloaded = connectorReady;
             if (!connectorReady) {
-                addError(null, "NeoForbric failed to download Sinytra Connector. Check the network or logs/neoforbric.log.");
+                addError(null, ForbricLog.TAG + " failed to download Sinytra Connector. Check the network or logs/neoforbric.log.");
             } else {
 
                 connectorJar = modsDir.resolve(connectorTarget.value().fileName());
@@ -1620,19 +2641,31 @@ public final class TranspileEngine {
             fabricApiReady = fabricApiOutcome.ok();
             fabricApiDownloaded = fabricApiReady;
             if (!fabricApiReady) {
-                addError(null, "NeoForbric failed to download Forgified Fabric API. Check the network or logs/neoforbric.log.");
+                addError(null, ForbricLog.TAG + " failed to download Forgified Fabric API. Check the network or logs/neoforbric.log.");
             }
         }
 
-        if (connectorReady) {
-            stage.done("connector", "Sinytra Connector ready");
-        } else {
-            stage.failed("connector", "Sinytra Connector unavailable");
+        if (!connectorDispatched) {
+            if (connectorReady) {
+                stage.done("connector", connectorInPlace
+                        ? "Sinytra Connector already in place" : "Sinytra Connector ready");
+            } else if (connectorUnanswered) {
+                stage.failed("connector", "Sinytra Connector is needed but the source could not be queried");
+            } else {
+                stage.failed("connector", "Sinytra Connector is needed but no build could be fetched");
+            }
         }
-        if (fabricApiReady) {
-            stage.done("ffapi", "Forgified Fabric API ready");
-        } else {
-            stage.failed("ffapi", "Forgified Fabric API unavailable");
+        if (!fabricApiDispatched) {
+            if (!fabricModsPresent) {
+                stage.kept("ffapi", "Forgified Fabric API not needed");
+            } else if (fabricApiReady) {
+                stage.done("ffapi", fabricApiInPlace
+                        ? "Forgified Fabric API already in place" : "Forgified Fabric API ready");
+            } else if (fabricApiUnanswered) {
+                stage.failed("ffapi", "Forgified Fabric API is needed but the source could not be queried");
+            } else {
+                stage.failed("ffapi", "Forgified Fabric API is needed but no build could be fetched");
+            }
         }
         endStage(stage);
 
@@ -1641,10 +2674,11 @@ public final class TranspileEngine {
                 fabricApiVersion, fabricApiDownloaded,
                 fabricApiOutcome.seconds(), connectorEnabled, fabricApiEnabled);
 
-        if (!connectorReady || !fabricApiReady) {
+        boolean fabricApiSatisfied = fabricApiReady || !fabricModsPresent;
+        if (!connectorReady || !fabricApiSatisfied) {
             ForbricLog.warn("  fabric support missing: fabric mods may fail to load");
         }
-        return new boolean[] {connectorReady, fabricApiReady, connectorDownloaded, fabricApiDownloaded,
+        return new boolean[] {connectorReady, fabricApiSatisfied, connectorDownloaded, fabricApiDownloaded,
                 connectorEnabled, fabricApiEnabled};
     }
 
@@ -1683,6 +2717,17 @@ public final class TranspileEngine {
             notes.add(displayName + " install failed: " + e);
         }
         return new DownloadOutcome(ok, (System.nanoTime() - startedAt) / 1e9);
+    }
+
+    private DownloadOutcome installSupport(ProgressStage stage, String taskId, TranspileTarget target,
+            String displayName, String expectedModId, boolean connector) {
+        DownloadOutcome outcome = installComponent(target, displayName, expectedModId, connector);
+        if (outcome.ok()) {
+            stage.done(taskId, displayName + " ready");
+        } else {
+            stage.failed(taskId, displayName + " is needed but the download failed");
+        }
+        return outcome;
     }
 
 
@@ -1804,6 +2849,9 @@ public final class TranspileEngine {
 
 
     private QueryResult<TranspileTarget> pinnedDependency(String connectorVersion, String projectSlug) {
+        if (modrinthForDependencies == null) {
+            return QueryResult.restricted(componentQuery.refusal());
+        }
         try {
             QueryResult<com.deepseek.neoforbric.net.ProjectRef> project =
                     modrinthForDependencies.projectBySlug(projectSlug);
@@ -2032,20 +3080,41 @@ public final class TranspileEngine {
 
     private void report(ModJarInfo jar, String action, String detail, boolean sameVersion) {
         reportEntry(jar.fileName(), jar.kind().name(), jar.markerSummary(), safe(jar.modId()), safe(jar.version()),
-                action, detail, sameVersion);
+                action, detail, sameVersion, Map.of());
     }
 
 
     private void report(String fileName, String action, String detail, boolean sameVersion) {
-        reportEntry(fileName, "-", "-", "", "", action, detail, sameVersion);
+        reportEntry(fileName, "-", "-", "", "", action, detail, sameVersion, Map.of());
     }
 
+
+    private void reportReplaced(ModJarInfo jar, Prepared prepared, InstallResult install, boolean sameVersion) {
+        ModJarInfo installed = inspectQuietly(install.installedPath());
+        Path backup = install.backupPath();
+        Map<String, String> extra = new LinkedHashMap<>();
+        extra.put("installedFile", install.installedPath().getFileName().toString());
+        extra.put("installedKind", installed.kind().name());
+        extra.put("installedVersion", versionText(installed));
+        extra.put("installedModIds", idText(installed));
+        extra.put("installedPath", install.installedPath().toString());
+        extra.put("backupPath", backup == null ? "" : backup.toString());
+        reportEntry(jar.fileName(), jar.kind().name(), jar.markerSummary(), safe(jar.modId()), safe(jar.version()),
+                "replaced", describeReplacement(prepared, install, installed, backup), sameVersion, extra);
+    }
+
+
     private void reportEntry(String fileName, String kind, String markers, String modId, String version, String action,
-            String detail, boolean sameVersion) {
-        reportEntries.add("{\"file\": \"" + escape(fileName) + "\", \"kind\": \"" + kind
+            String detail, boolean sameVersion, Map<String, String> extra) {
+        StringBuilder sb = new StringBuilder("{\"file\": \"" + escape(fileName) + "\", \"kind\": \"" + kind
                 + "\", \"markers\": \"" + markers + "\", \"modId\": \"" + escape(modId)
                 + "\", \"version\": \"" + escape(version) + "\", \"action\": \"" + action
-                + "\", \"sameVersion\": " + sameVersion + ", \"detail\": \"" + escape(detail) + "\"}");
+                + "\", \"sameVersion\": " + sameVersion + ", \"detail\": \"" + escape(detail) + "\"");
+        for (Map.Entry<String, String> entry : extra.entrySet()) {
+            sb.append(", \"").append(entry.getKey()).append("\": \"").append(escape(entry.getValue())).append('"');
+        }
+        sb.append('}');
+        reportEntries.add(sb.toString());
     }
 
 
@@ -2081,6 +3150,10 @@ public final class TranspileEngine {
     }
 
     private static String sha1Of(ModJarInfo jar) {
+        if (!Files.isRegularFile(jar.path()) || !Files.isReadable(jar.path())) {
+            ForbricLog.warn("sha1 skipped, the file cannot be read any more: %s", jar.fileName());
+            return null;
+        }
         try {
             return Hashes.sha1(jar.path());
         } catch (IOException e) {
@@ -2089,6 +3162,21 @@ public final class TranspileEngine {
         }
     }
 
+
+    private Pending nextCompleted(ExecutorCompletionService<Object> completions, Map<Future<Object>, Pending> pending) {
+        try {
+            Pending finished = pending.remove(completions.take());
+            if (finished != null) {
+                return finished;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        for (Future<Object> future : pending.keySet()) {
+            future.cancel(true);
+        }
+        return pending.remove(pending.keySet().iterator().next());
+    }
 
     private Object await(Future<?> future) {
         try {
@@ -2100,6 +3188,8 @@ public final class TranspileEngine {
             Throwable cause = e.getCause() == null ? e : e.getCause();
             ForbricLog.error("background task failed", cause);
             return new Failure(null, String.valueOf(cause), false);
+        } catch (java.util.concurrent.CancellationException e) {
+            return new Failure(null, "task cancelled", false);
         }
     }
 
@@ -2127,7 +3217,7 @@ public final class TranspileEngine {
 
 
     private ProgressStage beginStage(String id, String label, int totalSteps) {
-        ProgressStage stage = new ProgressStage(progress, id, label, totalSteps);
+        ProgressStage stage = new ProgressStage(progress, id, label, totalSteps, config.getBool("debug.progress", false));
         activeStage = stage;
         return stage;
     }

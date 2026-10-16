@@ -7,7 +7,8 @@ public record QueryResult<T>(Kind kind, T value, String detail) {
         OK,
         NOT_FOUND,
         TEMPORARY,
-        CONFIG_ERROR
+        CONFIG_ERROR,
+        RESTRICTED
     }
 
     public static <T> QueryResult<T> ok(T value) {
@@ -26,10 +27,15 @@ public record QueryResult<T>(Kind kind, T value, String detail) {
         return new QueryResult<>(Kind.CONFIG_ERROR, null, detail);
     }
 
+    public static <T> QueryResult<T> restricted(String detail) {
+        return new QueryResult<>(Kind.RESTRICTED, null, detail);
+    }
+
     public static <R> QueryResult<R> failureOf(QueryResult<?> source) {
         return switch (source.kind()) {
             case NOT_FOUND -> notFound(source.detail());
             case CONFIG_ERROR -> configError(source.detail());
+            case RESTRICTED -> restricted(source.detail());
             case TEMPORARY, OK -> temporary(source.detail());
         };
     }
@@ -42,8 +48,12 @@ public record QueryResult<T>(Kind kind, T value, String detail) {
         return kind == Kind.NOT_FOUND;
     }
 
+    public boolean restricted() {
+        return kind == Kind.RESTRICTED;
+    }
+
     public boolean uncertain() {
-        return kind == Kind.TEMPORARY || kind == Kind.CONFIG_ERROR;
+        return kind == Kind.TEMPORARY || kind == Kind.CONFIG_ERROR || kind == Kind.RESTRICTED;
     }
 
     public boolean hasValue() {

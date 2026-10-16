@@ -6,6 +6,7 @@ import com.deepseek.neoforbric.core.HiddenMods;
 import com.deepseek.neoforbric.core.ForbricConfig;
 import com.deepseek.neoforbric.core.ForbricLog;
 import com.deepseek.neoforbric.core.ProgressReporter;
+import com.deepseek.neoforbric.core.ScreenText;
 import com.deepseek.neoforbric.core.StartupTimer;
 import com.deepseek.neoforbric.core.TranspileEngine;
 import java.io.IOException;
@@ -19,7 +20,6 @@ import java.security.NoSuchAlgorithmException;
 import java.util.List;
 import net.neoforged.fml.ModLoadingIssue;
 import net.neoforged.fml.loading.FMLPaths;
-import net.neoforged.fml.loading.ImmediateWindowHandler;
 import net.neoforged.fml.loading.progress.ProgressMeter;
 import net.neoforged.fml.loading.progress.StartupNotificationManager;
 import net.neoforged.neoforgespi.ILaunchContext;
@@ -52,7 +52,7 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
         } catch (Throwable t) {
 
             ForbricLog.error("unexpected error in translation (ignored, game continues)", t);
-            ForbricLog.gameError("NeoForbric hit an unexpected error; the game will continue. Details: logs/neoforbric.log");
+            ForbricLog.gameError(ForbricLog.TAG + " hit an unexpected error; the game will continue. Details: logs/neoforbric.log");
 
 
             try {
@@ -81,7 +81,7 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
         BuildInfo build = BuildInfo.load();
         ForbricConfig config = ForbricConfig.load(gameDir);
         ForbricLog.banner(build.version(), gameDir.toString(), modsDir.toString(), launchTarget(context));
-        ForbricLog.game("NeoForbric %s - translating mods for NeoForge %s",
+        ForbricLog.game(ForbricLog.TAG + " %s - translating mods for NeoForge %s",
                 build.version(), build.gameVersion());
         ForbricLog.debug("connector not bundled; downloaded on demand (restart required). builtAgainst=%s",
                 build.connectorVersion());
@@ -119,7 +119,7 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
                 config.getList("hide.files", HiddenMods.DEFAULT_FILE_PREFIXES));
         writeHideList(modsDir, hideIds, hidePrefixes, hideNames, hideFiles);
 
-        ScreenProgress progress = new ScreenProgress();
+        ScreenProgress progress = new ScreenProgress(config.getBool("progress.files", true));
         TranspileEngine.Result result;
         TranspileEngine engine;
         try {
@@ -321,7 +321,8 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
     private void writeHideList(Path modsDir, List<String> ids, List<String> prefixes, List<String> names,
             List<String> files) {
         Path file = modsDir.resolve(TranspileEngine.WORK_DIR).resolve(HIDE_FILE_NAME);
-        String content = "# written by the NeoForbric locator, read by the body mod (mod list hide list)" + System.lineSeparator()
+        String content = "# written by the " + ForbricLog.TAG + " locator, read by the body mod"
+                + " (mod list hide list)" + System.lineSeparator()
                 + "ids=" + String.join(",", ids) + System.lineSeparator()
                 + "prefixes=" + String.join(",", prefixes) + System.lineSeparator()
                 + "names=" + String.join(",", names) + System.lineSeparator()
@@ -340,6 +341,18 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
 
         private static final int RESOLUTION = 10_000;
 
+        private static final int MAX_FILE_ROWS = 2;
+
+        private static final int MONOCRAFT_GLYPH_PX = 12;
+
+        private static final int TEXT_BUDGET_PX = 500;
+
+        private static final int TEXT_MAX = TEXT_BUDGET_PX / MONOCRAFT_GLYPH_PX;
+
+        private static final String DETAIL_SEPARATOR = " | ";
+
+        private static final int DETAIL_MIN = 8;
+
         private ProgressMeter meter;
         private String currentStage;
         private String stageLabel = "";
@@ -348,7 +361,17 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
         private int lastAbsolute = -1;
         private String lastLabel = "";
         private long lastStatusNanos;
-        private final java.util.Map<String, com.deepseek.neoforbric.core.DownloadEvent> downloads = new java.util.HashMap<>();
+        private String currentMessage = "";
+        private final java.util.Map<String, com.deepseek.neoforbric.core.DownloadEvent> downloads =
+                new java.util.HashMap<>();
+        private final java.util.LinkedHashMap<String, com.deepseek.neoforbric.core.DownloadEvent> activeFiles =
+                new java.util.LinkedHashMap<>();
+        private final java.util.Map<String, ProgressMeter> fileMeters = new java.util.LinkedHashMap<>();
+        private final boolean showFiles;
+
+        private ScreenProgress() { this(true); }
+
+        private ScreenProgress(boolean showFiles) { this.showFiles = showFiles; }
 
         @Override
         public synchronized void start(String label, int totalSteps) {
@@ -363,14 +386,16 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
         }
 
         private void beginStage(String label, int totalSteps) {
+            clearFiles();
             downloads.clear();
+            activeFiles.clear();
             stageLabel = label == null ? "" : label;
             stageTotal = Math.max(0, totalSteps);
             stageFinished = 0;
+            currentMessage = "";
             lastAbsolute = -1;
             ensureMeter(stageLabel);
             publish();
-            status(stageLabel);
         }
 
         @Override
@@ -396,6 +421,9 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
             stageTotal = Math.max(0, total);
             stageFinished = done + failed + skipped + kept;
             publish();
+            if (showFiles) {
+                refreshRows();
+            }
         }
 
         @Override
@@ -404,11 +432,12 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
                 return;
             }
             currentStage = null;
+            clearFiles();
             int ended = done + failed + skipped + kept;
             stageTotal = Math.max(stageTotal, ended);
             stageFinished = ended;
+            currentMessage = "";
             publish();
-            status(label);
         }
 
         @Override
@@ -421,7 +450,8 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
                 return;
             }
             lastStatusNanos = now;
-            status(englishText);
+            currentMessage = ScreenText.ascii(englishText);
+            publish();
         }
 
         @Override
@@ -436,7 +466,7 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
 
         @Override
         public synchronized void phaseDone(String englishText) {
-            status(englishText);
+            message(englishText);
         }
 
         @Override
@@ -451,11 +481,23 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
                 return;
             }
             downloads.put(event.taskId(), event);
-            if (event.state() == com.deepseek.neoforbric.core.DownloadEvent.State.PROGRESS) {
-                message("NeoForbric: Translating " + event.label() + " (attempt " + event.attempt() + ") "
-                        + (event.totalKnown() ? String.format(java.util.Locale.ROOT, "%.0f%%", event.fraction() * 100)
-                                : event.received() + " bytes"));
+            if (event.terminal()) {
+                activeFiles.remove(event.taskId());
+                removeFile(event.taskId());
+                if (showFiles) {
+                    refreshRows();
+                }
+                publish();
+                return;
             }
+            if (!activeFiles.containsKey(event.taskId())) {
+                currentMessage = "";
+            }
+            activeFiles.put(event.taskId(), event);
+            if (showFiles) {
+                refreshRows();
+            }
+            publish();
         }
 
         @Override
@@ -466,6 +508,7 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
         @Override
         public synchronized void finishAll() {
             currentStage = null;
+            clearFiles();
             ProgressMeter current = meter;
             meter = null;
             if (current != null) {
@@ -503,10 +546,30 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
 
 
         private String labelWithCounts() {
-            if (stageTotal > 0) {
-                return stageLabel + " (" + Math.min(stageFinished, stageTotal) + "/" + stageTotal + ")";
+            String counts = stageTotal > 0
+                    ? " (" + Math.min(stageFinished, stageTotal) + "/" + stageTotal + ")"
+                    : " (" + stageFinished + ")";
+            if (counts.length() >= TEXT_MAX) {
+                return counts.substring(0, TEXT_MAX);
             }
-            return stageLabel + " (" + stageFinished + ")";
+            String head = shorten(stageLabel, TEXT_MAX - counts.length()) + counts;
+            String detail = detailText();
+            int room = TEXT_MAX - head.length() - DETAIL_SEPARATOR.length();
+            if (detail.isEmpty() || room < DETAIL_MIN) {
+                return head;
+            }
+            return head + DETAIL_SEPARATOR + shorten(detail, room);
+        }
+
+
+        private String detailText() {
+            if (currentMessage.isBlank()) {
+                return "";
+            }
+            if (showFiles && !fileMeters.isEmpty()) {
+                return "";
+            }
+            return currentMessage;
         }
 
 
@@ -538,14 +601,109 @@ public final class NeoForbricLocator implements IModFileCandidateLocator {
         }
 
 
-        private void status(String englishText) {
+        private void clearFiles() {
+            for (String taskId : new java.util.ArrayList<>(fileMeters.keySet())) {
+                removeFile(taskId);
+            }
+            fileMeters.clear();
+            activeFiles.clear();
+        }
+
+
+        private void ensureRow(String taskId, com.deepseek.neoforbric.core.DownloadEvent event) {
+            if (fileMeters.containsKey(taskId)) {
+                return;
+            }
             try {
-                StartupNotificationManager.modLoaderMessage(englishText);
+                ProgressMeter row = StartupNotificationManager.prependProgressBar(fileText(event, 0), RESOLUTION);
+                if (row != null) {
+                    fileMeters.put(taskId, row);
+                }
             } catch (Throwable ignored) {
 
             }
+        }
+
+
+        private void refreshRows() {
+            int hidden = Math.max(0, activeFiles.size() - MAX_FILE_ROWS);
+            int shown = 0;
+            for (java.util.Map.Entry<String, com.deepseek.neoforbric.core.DownloadEvent> entry
+                    : activeFiles.entrySet()) {
+                if (shown >= MAX_FILE_ROWS) {
+                    removeFile(entry.getKey());
+                    continue;
+                }
+                ensureRow(entry.getKey(), entry.getValue());
+                updateRow(entry.getKey(), entry.getValue(), hidden);
+                shown++;
+            }
+        }
+
+
+        private void updateRow(String taskId, com.deepseek.neoforbric.core.DownloadEvent event, int hidden) {
+            ProgressMeter row = fileMeters.get(taskId);
+            if (row == null) {
+                return;
+            }
             try {
-                ImmediateWindowHandler.updateProgress(englishText);
+                row.setAbsolute(event.totalKnown() ? (int) Math.round(event.fraction() * RESOLUTION) : 0);
+                row.label(fileText(event, hidden));
+            } catch (Throwable ignored) {
+
+            }
+        }
+
+
+        private String fileText(com.deepseek.neoforbric.core.DownloadEvent event, int hidden) {
+            String progress = event.totalKnown()
+                    ? String.format(java.util.Locale.ROOT, "%.0f%%", event.fraction() * 100)
+                    : "~" + compactBytes(event.received());
+            String counts = stageTotal > 0
+                    ? Math.min(stageFinished, stageTotal) + "/" + stageTotal
+                    : stageFinished + "/?";
+            String attempt = event.attempt() > 1 ? " #" + event.attempt() : "";
+            String extra = hidden > 0 ? " +" + hidden : "";
+            String head = progress + " " + counts + attempt + " ";
+            int budget = Math.max(6, TEXT_MAX - head.length() - extra.length());
+            return head + shorten(ScreenText.ascii(event.label()), budget) + extra;
+        }
+
+
+        private static String compactBytes(long bytes) {
+            if (bytes >= 1024L * 1024L) {
+                return String.format(java.util.Locale.ROOT, "%.1fM", bytes / 1024.0 / 1024.0);
+            }
+            if (bytes >= 1024L) {
+                return Math.round(bytes / 1024.0) + "K";
+            }
+            return bytes + "B";
+        }
+
+
+        private static String shorten(String text, int budget) {
+            if (text == null) {
+                return "";
+            }
+            if (text.length() <= budget) {
+                return text;
+            }
+            if (budget <= 3) {
+                return text.substring(0, Math.max(0, budget));
+            }
+            int head = (budget - 2) / 2;
+            int tail = budget - 2 - head;
+            return text.substring(0, head) + ".." + text.substring(text.length() - tail);
+        }
+
+
+        private void removeFile(String taskId) {
+            ProgressMeter finished = fileMeters.remove(taskId);
+            if (finished == null) {
+                return;
+            }
+            try {
+                finished.complete();
             } catch (Throwable ignored) {
 
             }

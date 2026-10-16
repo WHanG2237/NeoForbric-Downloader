@@ -13,7 +13,7 @@ import java.time.format.DateTimeFormatter;
 
 public final class ForbricLog {
 
-    public static final String TAG = "NeoForbric";
+    public static final String TAG = BuildInfo.name();
 
 
     private static final String LOGGER_NAME = "neoforbric";

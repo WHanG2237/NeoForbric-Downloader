@@ -58,19 +58,23 @@ final class NeoForbricClothScreen {
 
         List<String> originalPortEntries = List.copyOf(portEntries);
         List<String> originalBlacklist = List.copyOf(blacklist);
+        java.util.concurrent.atomic.AtomicBoolean recommendedDownloads = new java.util.concurrent.atomic.AtomicBoolean();
 
         ConfigBuilder builder = ConfigBuilder.create()
                 .setParentScreen(parent)
                 .setTitle(Component.translatable(K + "title"))
                 .setDoesConfirmSave(true)
-                .setSavingRunnable(() -> save(config, portList.readable(), portEntries, originalPortEntries,
-                        blacklistList.readable(), blacklist, originalBlacklist));
+                .setSavingRunnable(() -> {
+                    if (recommendedDownloads.get()) { config.applyRecommendedDownloads(); }
+                    save(config, portList.readable(), portEntries, originalPortEntries,
+                            blacklistList.readable(), blacklist, originalBlacklist);
+                });
 
         ConfigEntryBuilder entries = builder.entryBuilder();
         generalCategory(builder, entries, config);
         restartCategory(builder, entries, config);
         transpileCategory(builder, entries, config);
-        networkCategory(builder, entries, config);
+        networkCategory(builder, entries, config, recommendedDownloads);
         portsCategory(builder, entries, portEntries);
         blacklistCategory(builder, entries, blacklist);
         debugCategory(builder, entries, config);
@@ -102,7 +106,7 @@ final class NeoForbricClothScreen {
         } catch (IOException | RuntimeException e) {
             lastSaveError = e.toString();
             BodyLog.error("config save FAILED, some changes may not have been saved: %s", e);
-            BodyLog.gameError("NeoForbric settings could not be saved: " + e);
+            BodyLog.gameError(BodyLog.tag() + " settings could not be saved: " + e);
             saveFailedToast();
         }
     }
@@ -155,24 +159,32 @@ final class NeoForbricClothScreen {
     }
 
 
-    private static void networkCategory(ConfigBuilder builder, ConfigEntryBuilder entries, BodyConfigFile config) {
+    private static void networkCategory(ConfigBuilder builder, ConfigEntryBuilder entries, BodyConfigFile config,
+            java.util.concurrent.atomic.AtomicBoolean recommendedDownloads) {
         ConfigCategory category = builder.getOrCreateCategory(Component.translatable(K + "category.network"));
         category.addEntry(entries.startTextDescription(Component.translatable(K + "network.hint")).build());
         category.addEntry(intField(entries, config, "network.deadline", "http.totalDeadlineSeconds", 600, 0, 86400));
         category.addEntry(intField(entries, config, "network.stall", "http.stallTimeoutSeconds", 45, 0, 3600));
         category.addEntry(intField(entries, config, "network.retries", "http.retries", 3, 0, 100));
-        category.addEntry(intField(entries, config, "network.threads", "http.parallelism", 8, 0, 128));
+        category.addEntry(entries.startBooleanToggle(Component.translatable(K + "network.recommended"), false)
+                .setDefaultValue(false).setTooltip(Component.translatable(K + "network.recommended.tip"))
+                .setSaveConsumer(recommendedDownloads::set).requireRestart().build());
+        category.addEntry(intField(entries, config, "network.threads", "http.parallelism", 1, 1, 128));
         category.addEntry(toggle(entries, config, "network.segmented", "http.segmented.enable", false));
-        category.addEntry(intField(entries, config, "network.segmented.max", "http.segmented.maxSegments", 4, 2, 4));
+        category.addEntry(intField(entries, config, "network.segmented.max", "http.segmented.maxSegments", 2, 2, 8));
         category.addEntry(intField(entries, config, "network.segmented.threshold", "http.segmented.thresholdMb", 16, 1,
                 1024));
         category.addEntry(intField(entries, config, "network.segmented.min", "http.segmented.minSegmentMb", 4, 1, 256));
-        category.addEntry(intField(entries, config, "network.maxactive", "http.maxActiveRequests", 8, 2, 64));
+        category.addEntry(intField(entries, config, "network.maxactive", "http.maxActiveRequests", 4, 2, 64));
         category.addEntry(intField(entries, config, "network.maxperhost", "http.maxRequestsPerHost", 4, 1, 32));
+        category.addEntry(toggle(entries, config, "network.progress.files", "progress.files", true));
         category.addEntry(toggle(entries, config, "network.mirror", "mirror.enable", true));
-        category.addEntry(toggle(entries, config, "network.curseforge", "source.curseforge.enable", true));
-        category.addEntry(toggle(entries, config, "network.mr.mirror", "source.modrinth.mirror.enable", true));
+        category.addEntry(toggle(entries, config, "network.thirdparty.modrinth",
+                "mirror.thirdparty.modrinth.enable", false));
+        category.addEntry(toggle(entries, config, "network.thirdparty.github", "mirror.thirdparty.github.enable",
+                false));
         category.addEntry(toggle(entries, config, "network.mr.official", "source.modrinth.official.enable", true));
+        category.addEntry(toggle(entries, config, "network.mr.mirror", "source.modrinth.mirror.enable", false));
     }
 
 
@@ -228,6 +240,7 @@ final class NeoForbricClothScreen {
     private static void debugCategory(ConfigBuilder builder, ConfigEntryBuilder entries, BodyConfigFile config) {
         ConfigCategory category = builder.getOrCreateCategory(Component.translatable(K + "category.debug"));
         category.addEntry(entries.startTextDescription(Component.translatable(K + "debug.hint")).build());
+        category.addEntry(toggle(entries, config, "debug.progress", "debug.progress", false));
 
 
         SubCategoryBuilder lastRun = entries.startSubCategory(Component.translatable(K + "debug.lastrun"));
